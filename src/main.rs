@@ -55,6 +55,10 @@ const LOGO: [&str; 10] = [
     r"                    |_|",
 ];
 
+// After a longer pause the buffered audio is old and the server has often closed the connection.
+const RESUME_LIVE_AFTER: Duration = Duration::from_secs(15);
+const MAX_RETRIES: u32 = 3;
+
 const MOTD_EVERY: Duration = Duration::from_secs(30 * 60);
 // how long the sparkles last when a phrase appears
 const SPARKLE_MS: u128 = 2000;
@@ -119,6 +123,9 @@ const BANDS: usize = 24;
 const F_LO: f32 = 40.0;
 const F_HI: f32 = 16000.0;
 const VIS_REQUEST: u64 = 1;
+const PING_REQUEST: u64 = 2;
+// no answer for this long: mpv hangs, start a new one
+const MPV_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn band_freq(i: usize) -> f32 {
     F_LO * (F_HI / F_LO).powf(i as f32 / (BANDS - 1) as f32)
@@ -194,6 +201,8 @@ enum Msg {
     Cover(String, Option<DynamicImage>),
     Browse(u64, Result<BrowseData, String>),
     Term(Event),
+    // mpv number n closed the socket: it crashed or was killed
+    MpvGone(u64),
 }
 
 const USER_AGENT: &str = "bloop/0.1";
@@ -201,13 +210,24 @@ const USER_AGENT: &str = "bloop/0.1";
 // mpv does all the audio work. We talk to it over JSON IPC.
 struct Mpv {
     sock: UnixStream,
+    // a hung mpv never notices that the socket closed, so we kill it ourselves
+    child: std::process::Child,
+    // tells a replaced mpv from the current one
+    id: u64,
+}
+
+impl Drop for Mpv {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Mpv {
     fn start(tx: Sender<Msg>, volume: f64) -> io::Result<Self> {
         // mpv quits when this socket closes, so it never outlives us.
         let (sock, theirs) = UnixStream::pair()?;
-        Command::new("mpv")
+        let child = Command::new("mpv")
             .args([
                 "--idle=yes",
                 "--no-video",
@@ -221,7 +241,8 @@ impl Mpv {
                 "--audio-display=no",
                 // live radio never seeks back, a small read-ahead is enough
                 "--demuxer-max-bytes=1MiB",
-                "--demuxer-max-back-bytes=0",
+                // mpv applies song titles from packets it keeps here, 0 loses every title
+                "--demuxer-max-back-bytes=256KiB",
                 "--msg-level=all=no",
                 "--input-ipc-client=fd://0",
             ])
@@ -235,17 +256,20 @@ impl Mpv {
                     "cannot start mpv ({e}). Install it: sudo apt install mpv"
                 ))
             })?;
+        static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let reader = BufReader::new(sock.try_clone()?);
         thread::spawn(move || {
             for line in reader.lines().map_while(Result::ok) {
                 if let Ok(v) = serde_json::from_str(&line)
                     && tx.send(Msg::Mpv(v)).is_err()
                 {
-                    break;
+                    return;
                 }
             }
+            let _ = tx.send(Msg::MpvGone(id));
         });
-        let mut mpv = Mpv { sock };
+        let mut mpv = Mpv { sock, child, id };
         for (i, p) in [
             "metadata",
             "pause",
@@ -254,6 +278,7 @@ impl Mpv {
             "audio-codec-name",
             "core-idle",
             "mute",
+            "seekable",
         ]
         .iter()
         .enumerate()
@@ -331,6 +356,14 @@ struct App {
     // sixel pixels can stay on screen, so clear once after an image change
     clear_screen: bool,
     paused: bool,
+    paused_at: Option<Instant>,
+    // live streams are not seekable, files are
+    live: bool,
+    retries: u32,
+    reconnect_at: Option<Instant>,
+    // watchdog: last ping sent, oldest ping without an answer
+    ping_at: Instant,
+    unanswered: Option<Instant>,
     idle: bool,
     core_idle: bool,
     muted: bool,
@@ -768,7 +801,11 @@ impl App {
         let still = self.now.is_some() && self.idle && !self.side.typing && self.form.is_none();
         let ms = if sparkles || self.meters.moving() {
             33
-        } else if buffering || self.side.busy() || self.recording.is_some() {
+        } else if buffering
+            || self.side.busy()
+            || self.recording.is_some()
+            || self.reconnect_at.is_some()
+        {
             100
         } else if still {
             1000
@@ -782,8 +819,66 @@ impl App {
         self.now.is_some() && !self.idle && !self.paused && !self.core_idle
     }
 
+    // A new mpv, with the volume and meters of the old one. Then tune in again.
+    fn restart_mpv(&mut self, why: &str) {
+        self.recording = None;
+        match Mpv::start(self.tx.clone(), self.settings.volume) {
+            Ok(mpv) => self.mpv = mpv,
+            Err(e) => {
+                self.status = format!("{why}, cannot restart it: {e}");
+                return;
+            }
+        }
+        (self.ping_at, self.unanswered) = (Instant::now(), None);
+        self.vis_on = false;
+        self.apply_vis();
+        let resume = !self.paused && !self.idle;
+        (self.paused, self.idle, self.core_idle) = (false, true, true);
+        if let (true, Some(st)) = (resume, self.now.clone()) {
+            self.play(st);
+        }
+        self.status = format!("{why}, restarted it");
+    }
+
+    // Called every frame: ping mpv, restart it when it hangs, release a long pause.
+    fn watchdog(&mut self) {
+        if self.ping_at.elapsed() > Duration::from_secs(2) {
+            self.mpv
+                .request(PING_REQUEST, json!(["get_property", "pid"]));
+            self.ping_at = Instant::now();
+            self.unanswered.get_or_insert(self.ping_at);
+        }
+        if self.unanswered.is_some_and(|t| t.elapsed() > MPV_TIMEOUT) {
+            return self.restart_mpv("audio engine did not answer");
+        }
+        // a long pause keeps the audio device and the connection open for nothing
+        if self.paused
+            && !self.idle
+            && self
+                .paused_at
+                .is_some_and(|t| t.elapsed() > RESUME_LIVE_AFTER)
+        {
+            self.stop_recording();
+            self.mpv.cmd(json!(["stop"]));
+        }
+    }
+
+    // Live radio: resume a long pause or a dropped stream by tuning in again.
+    fn toggle_pause(&mut self) {
+        let Some(st) = self.now.clone() else { return };
+        let stale = self
+            .paused_at
+            .is_some_and(|t| t.elapsed() > RESUME_LIVE_AFTER);
+        if self.idle || stale {
+            self.play(st);
+        } else {
+            self.mpv.cmd(json!(["cycle", "pause"]));
+        }
+    }
+
     fn play(&mut self, st: Station) {
         self.stop_recording();
+        self.reconnect_at = None;
         self.mpv.set("pause", json!(false));
         self.mpv.cmd(json!(["loadfile", st.url]));
         self.meta.clear();
@@ -866,6 +961,10 @@ impl App {
                 }
             }
             Msg::Browse(id, res) => self.on_browse_data(id, res),
+            Msg::MpvGone(id) if id == self.mpv.id => self.restart_mpv("audio engine stopped"),
+            // an mpv we replaced ourselves
+            Msg::MpvGone(_) => {}
+            Msg::Mpv(v) if v["request_id"] == PING_REQUEST => self.unanswered = None,
             Msg::Mpv(v) if v["request_id"] == VIS_REQUEST => {
                 if v["data"].is_object() {
                     self.meters.push(&v["data"]);
@@ -897,7 +996,11 @@ impl App {
                                 }
                             }
                         }
-                        "pause" => self.paused = d.as_bool().unwrap_or(false),
+                        "pause" => {
+                            self.paused = d.as_bool().unwrap_or(false);
+                            self.paused_at = self.paused.then(Instant::now);
+                        }
+                        "seekable" => self.live = d.as_bool() == Some(false),
                         "volume" => {
                             self.volume = d.as_f64().unwrap_or(self.volume);
                             if (self.volume - self.settings.volume).abs() > 0.1 {
@@ -917,12 +1020,35 @@ impl App {
                         _ => {}
                     }
                 }
-                (Some("end-file"), _) if v["reason"] == "error" => {
-                    self.recording = None;
-                    self.status = format!(
-                        "playback error: {}",
-                        v["file_error"].as_str().unwrap_or("unknown")
-                    );
+                (Some("playback-restart"), _) => self.retries = 0,
+                (Some("end-file"), _) => {
+                    // "stop" is our own stop or a new station, "eof" on a file is its normal end
+                    let reason = v["reason"].as_str().unwrap_or("");
+                    let error = v["file_error"].as_str().unwrap_or("");
+                    // the sound server is down: reconnecting to the station does not help
+                    if error.contains("audio output") {
+                        self.stop_recording();
+                        self.status = "no sound device: the sound server does not answer \
+                            (on WSL, run `wsl --shutdown` in Windows)"
+                            .into();
+                        return;
+                    }
+                    let dropped = reason == "error" || (reason == "eof" && self.live);
+                    if !dropped || self.now.is_none() {
+                        return;
+                    }
+                    // a reconnect would overwrite the file
+                    self.stop_recording();
+                    if self.retries < MAX_RETRIES {
+                        self.retries += 1;
+                        self.reconnect_at =
+                            Some(Instant::now() + Duration::from_secs(2 * self.retries as u64));
+                        self.status =
+                            format!("stream lost, reconnecting ({}/{MAX_RETRIES})", self.retries);
+                    } else {
+                        let why = v["file_error"].as_str().unwrap_or("stream ended");
+                        self.status = format!("playback error: {why}");
+                    }
                 }
                 _ => {}
             },
@@ -990,9 +1116,11 @@ impl App {
             KeyCode::Char('q') => return false,
             KeyCode::Tab => self.switch_tab(),
             KeyCode::Char('/') => self.side.typing = true,
-            KeyCode::Char(' ') => self.mpv.cmd(json!(["cycle", "pause"])),
+            KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('s') => {
+                self.reconnect_at = None;
                 self.stop_recording();
+                self.mpv.set("pause", json!(false));
                 self.mpv.cmd(json!(["stop"]));
             }
             // relative, so fast key presses never use a stale volume
@@ -1476,8 +1604,12 @@ impl App {
             return f.render_widget(Paragraph::new(self.logo_lines()), area);
         }
         let (label, color) = match () {
-            _ if self.now.is_none() || self.idle => ("■ STOPPED".to_string(), DIM),
-            _ if self.paused => (
+            _ if self.reconnect_at.is_some() => (
+                format!("{} RECONNECTING", SPINNER[self.tick % 10]),
+                Color::Yellow,
+            ),
+            // a long pause stops mpv, it still is a pause for the user
+            _ if self.now.is_some() && self.paused => (
                 if (self.tick / 5).is_multiple_of(2) {
                     "▮▮ PAUSED"
                 } else {
@@ -1486,6 +1618,7 @@ impl App {
                 .to_string(),
                 Color::Yellow,
             ),
+            _ if self.now.is_none() || self.idle => ("■ STOPPED".to_string(), DIM),
             _ if self.core_idle => (
                 format!("{} BUFFERING", SPINNER[self.tick % 10]),
                 Color::Yellow,
@@ -1666,6 +1799,12 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
             if app.side.search_due() {
                 app.side.reload(&app.tx);
             }
+            app.watchdog();
+            if app.reconnect_at.is_some_and(|t| Instant::now() >= t)
+                && let Some(st) = app.now.clone()
+            {
+                app.play(st);
+            }
             if std::mem::take(&mut app.clear_screen) {
                 // not term.clear(): it asks the terminal for the cursor position,
                 // and the input thread would swallow the answer
@@ -1779,6 +1918,12 @@ fn main() -> io::Result<()> {
         picker: None,
         clear_screen: false,
         paused: false,
+        paused_at: None,
+        live: false,
+        retries: 0,
+        reconnect_at: None,
+        ping_at: Instant::now(),
+        unanswered: None,
         idle: true,
         core_idle: true,
         muted: false,
