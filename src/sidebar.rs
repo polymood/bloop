@@ -68,6 +68,11 @@ impl Sidebar {
         }
     }
 
+    // waiting for radio-browser, or for a pause in typing
+    pub fn busy(&self) -> bool {
+        self.browse.loading || self.browse.due.is_some()
+    }
+
     pub fn search_due(&self) -> bool {
         self.browse.due.is_some_and(|d| Instant::now() >= d)
     }

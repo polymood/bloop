@@ -12,12 +12,9 @@ use std::{
 use image::{DynamicImage, imageops::FilterType};
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::{
-        event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-        },
-        execute,
+    backend::{Backend, ClearType},
+    crossterm::event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Style, Stylize},
@@ -117,7 +114,8 @@ const WAVES: [&str; 4] = [
 ];
 
 // Spectrum: band-pass filters inside mpv, measured with astats.
-const BANDS: usize = 32;
+// 24 bands is about a third of an octave each. More bands cost CPU in astats.
+const BANDS: usize = 24;
 const F_LO: f32 = 40.0;
 const F_HI: f32 = 16000.0;
 const VIS_REQUEST: u64 = 1;
@@ -135,8 +133,8 @@ fn vis_filter() -> String {
         ids("b")
     );
     for i in 0..BANDS {
-        let bp = format!("bandpass=f={:.0}:width_type=o:w={w:.3}", band_freq(i));
-        g += &format!("[b{i}]{bp},{bp}[f{i}];");
+        let f = band_freq(i);
+        g += &format!("[b{i}]bandpass=f={f:.0}:width_type=o:w={w:.3}[f{i}];");
     }
     g += &format!(
         "[a]{}amerge=inputs={},astats=metadata=1:reset=1:measure_overall=none:measure_perchannel=RMS_level+Peak_level,pan=stereo|c0=c0|c1=c1",
@@ -144,7 +142,8 @@ fn vis_filter() -> String {
         BANDS + 1
     );
     // %len% is mpv's escape for special characters
-    format!("@vis:lavfi=graph=%{}%{g}", g.len())
+    // one thread: 24 tiny filters do not need a thread pool
+    format!("@vis:lavfi=graph=%{}%{g}:o=[threads=1]", g.len())
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -194,6 +193,7 @@ enum Msg {
     Image(String, Option<DynamicImage>),
     Cover(String, Option<DynamicImage>),
     Browse(u64, Result<BrowseData, String>),
+    Term(Event),
 }
 
 const USER_AGENT: &str = "bloop/0.1";
@@ -213,6 +213,16 @@ impl Mpv {
                 "--no-video",
                 "--no-terminal",
                 "--volume-max=100",
+                // lean: no Lua scripts, no youtube-dl, no video
+                "--load-scripts=no",
+                "--ytdl=no",
+                "--osc=no",
+                "--vid=no",
+                "--audio-display=no",
+                // live radio never seeks back, a small read-ahead is enough
+                "--demuxer-max-bytes=1MiB",
+                "--demuxer-max-back-bytes=0",
+                "--msg-level=all=no",
                 "--input-ipc-client=fd://0",
             ])
             .arg(format!("--volume={volume}"))
@@ -360,6 +370,11 @@ impl Meters {
         }
     }
 
+    // bars on screen that still move
+    fn moving(&self) -> bool {
+        !self.db.is_empty() || self.level.iter().chain(&self.hold).any(|v| *v > 0.001)
+    }
+
     fn push(&mut self, data: &Value) {
         let get = |ch: usize, k: &str| {
             data[format!("lavfi.astats.{ch}.{k}")]
@@ -464,7 +479,13 @@ fn fetch_image(src: &str) -> Option<DynamicImage> {
     } else {
         std::fs::read(src).ok()?
     };
-    image::load_from_memory(&bytes).ok()
+    let img = image::load_from_memory(&bytes).ok()?;
+    // the art area is about 300 px wide, a 1024 px logo would only waste RAM
+    Some(if img.width() > 400 || img.height() > 400 {
+        img.thumbnail(400, 400)
+    } else {
+        img
+    })
 }
 
 fn load_image(src: String, tx: Sender<Msg>) {
@@ -740,6 +761,23 @@ impl App {
         }
     }
 
+    // Redraw only as often as something on screen moves.
+    fn frame_interval(&self) -> Duration {
+        let sparkles = self.motd.1.elapsed().as_millis() < SPARKLE_MS;
+        let buffering = self.now.is_some() && !self.idle && self.core_idle && !self.paused;
+        let still = self.now.is_some() && self.idle && !self.side.typing && self.form.is_none();
+        let ms = if sparkles || self.meters.moving() {
+            33
+        } else if buffering || self.side.busy() || self.recording.is_some() {
+            100
+        } else if still {
+            1000
+        } else {
+            200
+        };
+        Duration::from_millis(ms)
+    }
+
     fn playing(&self) -> bool {
         self.now.is_some() && !self.idle && !self.paused && !self.core_idle
     }
@@ -810,6 +848,8 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
+            // handled in run()
+            Msg::Term(_) => {}
             Msg::Image(src, img) => {
                 if self.now.as_ref().is_some_and(|s| s.image == src) {
                     if img.is_none() {
@@ -1608,48 +1648,65 @@ fn freq_axis(w: usize) -> String {
     s.into_iter().collect()
 }
 
+// Sleeps until a key, a mouse click, an mpv message or the next animation frame.
 fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> io::Result<()> {
-    let frame = Duration::from_millis(33);
     let start = Instant::now();
     let mut last = start;
+    let mut redraw = true;
     loop {
-        while let Ok(m) = rx.try_recv() {
-            app.on_msg(m);
-        }
         let now = Instant::now();
-        if now - last >= frame {
+        if redraw || now - last >= app.frame_interval() {
             app.tick = (start.elapsed().as_millis() / 100) as usize;
             let live = app.playing() && app.vis_on;
-            app.meters.step((now - last).as_secs_f32(), live);
+            app.meters.step((now - last).as_secs_f32().min(0.2), live);
             if live {
                 app.mpv
                     .request(VIS_REQUEST, json!(["get_property", "af-metadata/vis"]));
             }
-            last = now;
-        }
-        if app.side.search_due() {
-            app.side.reload(&app.tx);
-        }
-        if std::mem::take(&mut app.clear_screen) {
-            term.clear()?;
-        }
-        term.draw(|f| app.draw(f))?;
-        // read all queued keys before the next draw
-        let mut timeout = frame.saturating_sub(last.elapsed());
-        while event::poll(timeout)? {
-            let go_on = match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    app.on_key_event(k.code, k.modifiers)
-                }
-                Event::Mouse(m) => app.on_mouse(m),
-                _ => true,
-            };
-            if !go_on {
-                return Ok(());
+            if app.side.search_due() {
+                app.side.reload(&app.tx);
             }
-            timeout = Duration::ZERO;
+            if std::mem::take(&mut app.clear_screen) {
+                // not term.clear(): it asks the terminal for the cursor position,
+                // and the input thread would swallow the answer
+                term.backend_mut().clear_region(ClearType::All)?;
+                // two swaps leave an empty "previous" buffer, so the next draw repaints all
+                term.swap_buffers();
+                term.swap_buffers();
+            }
+            term.draw(|f| app.draw(f))?;
+            last = now;
+            redraw = false;
+        }
+        let wait = app.frame_interval().saturating_sub(last.elapsed());
+        let Ok(m) = rx.recv_timeout(wait) else {
+            continue;
+        };
+        // meter values are drawn with the next frame, not at once
+        redraw = !matches!(&m, Msg::Mpv(v) if v["request_id"] == VIS_REQUEST);
+        let go_on = match m {
+            Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                app.on_key_event(k.code, k.modifiers)
+            }
+            Msg::Term(Event::Mouse(m)) => app.on_mouse(m),
+            Msg::Term(_) => true,
+            m => {
+                app.on_msg(m);
+                true
+            }
+        };
+        if !go_on {
+            return Ok(());
         }
     }
+}
+
+// Clicks and the wheel only. EnableMouseCapture also reports every mouse move.
+fn mouse(on: bool) {
+    let mode = if on { "h" } else { "l" };
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b[?1000{mode}\x1b[?1006{mode}");
+    let _ = out.flush();
 }
 
 // Ask the terminal for its graphics protocol and cell size.
@@ -1751,16 +1808,24 @@ fn main() -> io::Result<()> {
     term.draw(|f| app.draw(f))?;
     app.picker = probe_graphics();
     // after the probe, mouse events would confuse it
-    execute!(io::stdout(), EnableMouseCapture)?;
+    mouse(true);
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        mouse(false);
         hook(info);
     }));
+    let input = app.tx.clone();
+    thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if input.send(Msg::Term(ev)).is_err() {
+                break;
+            }
+        }
+    });
     // start the sparkles after the probe, it can block for 2 s
     app.motd.1 = Instant::now();
     let res = run(&mut term, &mut app, &rx);
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    mouse(false);
     ratatui::restore();
     res
 }
