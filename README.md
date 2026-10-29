@@ -40,11 +40,36 @@ bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
 
 ## Installation
 
+### From a release
+
 1. Install mpv:
 
    ```sh
-   sudo apt install mpv
+   sudo apt install mpv    # Debian, Ubuntu, WSL
+   brew install mpv        # macOS
    ```
+
+2. Download the archive for your system from the [releases page](../../releases):
+
+   - `x86_64-unknown-linux-musl`: Linux and WSL on x86_64.
+   - `aarch64-apple-darwin`: macOS on Apple silicon.
+
+3. Extract the archive and put `bloop` in a directory of your `PATH`:
+
+   ```sh
+   tar xzf bloop-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+   install bloop-v0.1.0-x86_64-unknown-linux-musl/bloop ~/.local/bin/
+   ```
+
+4. Start bloop:
+
+   ```sh
+   bloop
+   ```
+
+### From the source code
+
+1. Install mpv and Rust 1.88 or later.
 
 2. Build and install bloop:
 
@@ -52,11 +77,18 @@ bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
    cargo install --path . --locked
    ```
 
-3. Start bloop:
+### Make a release
+
+1. Change the version in `Cargo.toml`.
+2. Commit the change.
+3. Push a tag with the same version:
 
    ```sh
-   bloop
+   git tag v0.2.0
+   git push origin v0.2.0
    ```
+
+GitHub Actions builds the archives and publishes the release.
 
 ## Keys
 
