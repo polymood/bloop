@@ -12,8 +12,14 @@ use std::{
 use image::{DynamicImage, imageops::FilterType};
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
-    layout::{Alignment, Constraint, Layout, Margin, Rect},
+    crossterm::{
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        },
+        execute,
+    },
+    layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, LineGauge, List, ListState, Paragraph},
@@ -25,6 +31,9 @@ use ratatui_image::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+
+mod sidebar;
+use sidebar::{BrowseData, Sidebar, Tab};
 
 const ACCENT: Color = Color::Rgb(0, 200, 255);
 const PINK: Color = Color::Rgb(255, 80, 200);
@@ -48,6 +57,10 @@ const LOGO: [&str; 10] = [
     r"                    | |",
     r"                    |_|",
 ];
+
+const MOTD_EVERY: Duration = Duration::from_secs(30 * 60);
+// how long the sparkles last when a phrase appears
+const SPARKLE_MS: u128 = 2000;
 
 const MOTD: [&str; 45] = [
     "thank you for tuning in",
@@ -140,6 +153,8 @@ struct Station {
     url: String,
     #[serde(default)]
     image: String,
+    #[serde(default)]
+    section: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +167,10 @@ struct Settings {
     hires_images: bool,
     // mpv processes audio before the speakers play it
     meter_delay_ms: u64,
+    volume: f64,
+    last_url: String,
+    last_section: String,
+    folded: Vec<String>,
 }
 
 impl Default for Settings {
@@ -162,6 +181,10 @@ impl Default for Settings {
             cover_art: true,
             hires_images: true,
             meter_delay_ms: 250,
+            volume: 50.0,
+            last_url: String::new(),
+            last_section: String::new(),
+            folded: vec![],
         }
     }
 }
@@ -170,7 +193,7 @@ enum Msg {
     Mpv(Value),
     Image(String, Option<DynamicImage>),
     Cover(String, Option<DynamicImage>),
-    Search(String, Result<Vec<(Station, String)>, String>),
+    Browse(u64, Result<BrowseData, String>),
 }
 
 const USER_AGENT: &str = "bloop/0.1";
@@ -181,7 +204,7 @@ struct Mpv {
 }
 
 impl Mpv {
-    fn start(tx: Sender<Msg>) -> io::Result<Self> {
+    fn start(tx: Sender<Msg>, volume: f64) -> io::Result<Self> {
         // mpv quits when this socket closes, so it never outlives us.
         let (sock, theirs) = UnixStream::pair()?;
         Command::new("mpv")
@@ -189,9 +212,10 @@ impl Mpv {
                 "--idle=yes",
                 "--no-video",
                 "--no-terminal",
-                "--volume=50",
+                "--volume-max=100",
                 "--input-ipc-client=fd://0",
             ])
+            .arg(format!("--volume={volume}"))
             .stdin(Stdio::from(OwnedFd::from(theirs)))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -246,18 +270,31 @@ enum FormKind {
     Add,
     Edit(usize),
     Open,
+    Move(usize),
+    Rename(String),
+    SaveTo(Station),
+}
+
+// What a mouse click on a screen area does.
+#[derive(Clone, PartialEq)]
+enum Hit {
+    // same as pushing this key
+    Key(KeyCode),
+    Tab(Tab),
     Search,
+    // the row comes from the click position
+    List,
+    Category(usize),
+    // the mouse wheel changes the volume here
+    Player,
+    Volume,
+    Setting(usize),
+    Popup,
 }
 
 enum Art {
     Blocks(Vec<Line<'static>>),
     Graphic(Protocol),
-}
-
-struct SearchResults {
-    query: String,
-    items: Vec<(Station, String)>,
-    list: ListState,
 }
 
 struct Form {
@@ -270,12 +307,11 @@ struct App {
     mpv: Mpv,
     tx: Sender<Msg>,
     stations: Vec<Station>,
-    list: ListState,
+    side: Sidebar,
     form: Option<Form>,
     settings: Settings,
     settings_row: Option<usize>,
     vis_on: bool,
-    results: Option<SearchResults>,
     now: Option<Station>,
     meta: BTreeMap<String, String>,
     logo: Option<DynamicImage>,
@@ -294,8 +330,13 @@ struct App {
     status: String,
     // 10 Hz
     tick: usize,
-    motd_seed: usize,
+    // current phrase and when it started to slide
+    motd: (usize, Instant),
     meters: Meters,
+    // click areas of the last frame, the last one is on top
+    hits: Vec<(Rect, Hit)>,
+    // for double clicks
+    last_click: Option<(Instant, u16, u16)>,
 }
 
 // Each vec holds [L, R, bands...], 0..1.
@@ -475,42 +516,6 @@ fn load_cover(title: String, tx: Sender<Msg>) {
     });
 }
 
-fn search_stations(query: String, tx: Sender<Msg>) {
-    thread::spawn(move || {
-        let res = ureq::get("https://all.api.radio-browser.info/json/stations/search")
-            .header("User-Agent", USER_AGENT)
-            .query("name", &query)
-            .query("limit", "100")
-            .query("hidebroken", "true")
-            .query("order", "clickcount")
-            .query("reverse", "true")
-            .call()
-            .and_then(|mut r| r.body_mut().read_json::<Vec<Value>>())
-            .map_err(|e| e.to_string())
-            .map(|list| {
-                list.iter()
-                    .map(|s| {
-                        let txt = |k: &str| s[k].as_str().unwrap_or("").trim().to_string();
-                        let st = Station {
-                            name: txt("name"),
-                            url: txt("url_resolved"),
-                            image: txt("favicon"),
-                        };
-                        let bitrate = s["bitrate"]
-                            .as_u64()
-                            .filter(|b| *b > 0)
-                            .map(|b| format!(" {b}k"))
-                            .unwrap_or_default();
-                        let info = format!("{} · {}{bitrate}", txt("countrycode"), txt("codec"));
-                        (st, info)
-                    })
-                    .filter(|(st, _)| !st.url.is_empty())
-                    .collect()
-            });
-        let _ = tx.send(Msg::Search(query, res));
-    });
-}
-
 // Two pixels per cell: top pixel = foreground of '▀', bottom pixel = background.
 fn halfblock_art(img: &DynamicImage, area: Rect) -> Vec<Line<'static>> {
     let aspect = img.width() as f32 / img.height() as f32;
@@ -539,6 +544,11 @@ fn halfblock_art(img: &DynamicImage, area: Rect) -> Vec<Line<'static>> {
             )
         })
         .collect()
+}
+
+// cheap pseudo random number
+fn hash(k: usize) -> usize {
+    k.wrapping_mul(2654435761) >> 7
 }
 
 fn marquee(s: &str, w: usize, tick: usize) -> String {
@@ -588,33 +598,130 @@ fn panel(title: &str) -> Block<'_> {
         .title(Span::raw(format!(" {title} ")).fg(ACCENT).bold())
 }
 
-fn chips(keys: &[(&str, &str)]) -> Line<'static> {
-    Line::from(
-        keys.iter()
-            .flat_map(|(k, d)| {
-                [
-                    Span::raw(format!(" {k} "))
-                        .fg(Color::White)
-                        .bg(CHIP_BG)
-                        .bold(),
-                    Span::raw(format!(" {d}  ")).fg(DIM),
-                ]
-            })
-            .collect::<Vec<_>>(),
-    )
+// "enter" -> Enter, "a" -> 'a'. Chips like "J K" have no single key.
+fn chip_key(label: &str) -> Option<KeyCode> {
+    match label {
+        "enter" => Some(KeyCode::Enter),
+        "esc" => Some(KeyCode::Esc),
+        "tab" => Some(KeyCode::Tab),
+        "space" => Some(KeyCode::Char(' ')),
+        _ if label.chars().count() == 1 => label.chars().next().map(KeyCode::Char),
+        _ => None,
+    }
 }
 
 impl App {
+    // Key chips that wrap to the next line and react to clicks.
+    fn chip_bar(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        first: Vec<Span<'static>>,
+        keys: &[(&str, &str)],
+    ) {
+        let mut lines = vec![Line::from(first)];
+        let mut x = lines[0].width() as u16;
+        for (k, d) in keys {
+            let chip = Span::raw(format!(" {k} "))
+                .fg(Color::White)
+                .bg(CHIP_BG)
+                .bold();
+            let desc = Span::raw(format!(" {d}  ")).fg(DIM);
+            let w = (chip.width() + desc.width()) as u16;
+            if x + w > area.width && x > 0 {
+                lines.push(Line::default());
+                x = 0;
+            }
+            let y = area.y + lines.len() as u16 - 1;
+            if let Some(code) = chip_key(k) {
+                let r = Rect::new(area.x + x, y, w, 1).intersection(area);
+                self.hits.push((r, Hit::Key(code)));
+            }
+            x += w;
+            lines.last_mut().unwrap().spans.extend([chip, desc]);
+        }
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    // false = quit
+    fn on_mouse(&mut self, m: MouseEvent) -> bool {
+        let pos = Position::new(m.column, m.row);
+        let under: Vec<(Rect, Hit)> = self
+            .hits
+            .iter()
+            .filter(|(r, _)| r.contains(pos))
+            .cloned()
+            .collect();
+        let popup = self.settings_row.is_some() || self.form.is_some();
+        if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = m.kind {
+            let up = m.kind == MouseEventKind::ScrollUp;
+            let on = |h: Hit| !popup && under.iter().any(|(_, x)| *x == h);
+            if on(Hit::List) {
+                self.side.typing = false;
+                self.on_side_key(if up { KeyCode::Up } else { KeyCode::Down });
+            } else if on(Hit::Player) {
+                self.mpv
+                    .cmd(json!(["add", "volume", if up { 5 } else { -5 }]));
+            }
+            return true;
+        }
+        if m.kind != MouseEventKind::Down(MouseButton::Left) {
+            return true;
+        }
+        let double = self.last_click.is_some_and(|(t, x, y)| {
+            t.elapsed() < Duration::from_millis(400) && (x, y) == (m.column, m.row)
+        });
+        self.last_click = Some((Instant::now(), m.column, m.row));
+        let Some((rect, hit)) = under.last().cloned() else {
+            self.settings_row = None;
+            return true;
+        };
+        // a popup only reacts to its own areas and to the key chips
+        if self.settings_row.is_some() && !matches!(hit, Hit::Popup | Hit::Setting(_) | Hit::Key(_))
+        {
+            self.settings_row = None;
+            return true;
+        }
+        if self.form.is_some() && !matches!(hit, Hit::Key(_)) {
+            return true;
+        }
+        match hit {
+            Hit::Key(k) => return self.on_key(k),
+            Hit::Tab(t) if t != self.side.tab => self.switch_tab(),
+            Hit::Search => self.side.typing = true,
+            Hit::List => self.click_row((m.row - rect.y) as usize, double),
+            Hit::Category(i) => {
+                self.side.typing = false;
+                self.on_side_key(KeyCode::Char((b'1' + i as u8) as char));
+            }
+            Hit::Volume => {
+                let v = (m.column - rect.x) as f64 / rect.width.saturating_sub(1).max(1) as f64;
+                self.mpv.set("volume", json!((v * 100.0).round()));
+            }
+            Hit::Setting(i) => {
+                self.settings_row = Some(i);
+                self.on_key(KeyCode::Enter);
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn save_stations(&mut self) {
         if let Err(e) = save_json("stations.json", &self.stations) {
             self.status = e;
         }
     }
 
-    fn save_settings(&mut self) {
+    fn persist_settings(&mut self) {
         if let Err(e) = save_json("settings.json", &self.settings) {
             self.status = e;
         }
+    }
+
+    // after a change in the settings page
+    fn save_settings(&mut self) {
+        self.persist_settings();
         self.meters.delay = Duration::from_millis(self.settings.meter_delay_ms);
         self.art_cache = None;
         self.apply_vis();
@@ -650,6 +757,10 @@ impl App {
             load_image(st.image.clone(), self.tx.clone());
         }
         self.status = format!("tuning in to {}", st.url);
+        if self.settings.last_url != st.url {
+            self.settings.last_url = st.url.clone();
+            self.persist_settings();
+        }
         self.now = Some(st);
     }
 
@@ -714,14 +825,7 @@ impl App {
                     self.art_cache = None;
                 }
             }
-            Msg::Search(query, res) => match res {
-                Ok(items) => {
-                    self.status = format!("{} stations found for \"{query}\"", items.len());
-                    let list = ListState::default().with_selected((!items.is_empty()).then_some(0));
-                    self.results = Some(SearchResults { query, items, list });
-                }
-                Err(e) => self.status = format!("search failed: {e}"),
-            },
+            Msg::Browse(id, res) => self.on_browse_data(id, res),
             Msg::Mpv(v) if v["request_id"] == VIS_REQUEST => {
                 if v["data"].is_object() {
                     self.meters.push(&v["data"]);
@@ -754,7 +858,13 @@ impl App {
                             }
                         }
                         "pause" => self.paused = d.as_bool().unwrap_or(false),
-                        "volume" => self.volume = d.as_f64().unwrap_or(self.volume),
+                        "volume" => {
+                            self.volume = d.as_f64().unwrap_or(self.volume);
+                            if (self.volume - self.settings.volume).abs() > 0.1 {
+                                self.settings.volume = self.volume;
+                                self.persist_settings();
+                            }
+                        }
                         "mute" => self.muted = d.as_bool().unwrap_or(false),
                         "core-idle" => self.core_idle = d.as_bool().unwrap_or(true),
                         "idle-active" => {
@@ -780,6 +890,25 @@ impl App {
     }
 
     // false = quit
+    // Ctrl+C quits, Ctrl+U clears the text field, other Ctrl keys do nothing.
+    fn on_key_event(&mut self, key: KeyCode, mods: KeyModifiers) -> bool {
+        if !mods.contains(KeyModifiers::CONTROL) {
+            return self.on_key(key);
+        }
+        match key {
+            KeyCode::Char('c') => return false,
+            KeyCode::Char('u') => {
+                if let Some(form) = &mut self.form {
+                    form.fields[form.idx].1.clear();
+                } else if self.side.typing {
+                    self.clear_search();
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn on_key(&mut self, key: KeyCode) -> bool {
         if let Some(form) = &mut self.form {
             match key {
@@ -813,150 +942,50 @@ impl App {
             self.save_settings();
             return true;
         }
-        if let Some(res) = &mut self.results {
-            let sel = res
-                .list
-                .selected()
-                .and_then(|i| res.items.get(i))
-                .map(|(st, _)| st.clone());
-            match (key, sel) {
-                (KeyCode::Esc, _) => self.results = None,
-                (KeyCode::Down | KeyCode::Char('j'), _) => res.list.select_next(),
-                (KeyCode::Up | KeyCode::Char('k'), _) => res.list.select_previous(),
-                (KeyCode::Enter, Some(st)) => self.play(st),
-                (KeyCode::Char('a'), Some(st)) => {
-                    self.status = format!("saved {}", st.name);
-                    self.stations.push(st);
-                    self.save_stations();
-                }
-                _ => return self.on_main_key(key),
-            }
+        if self.side.typing {
+            self.on_typing_key(key);
             return true;
         }
-        self.on_main_key(key)
-    }
-
-    fn on_main_key(&mut self, key: KeyCode) -> bool {
-        let sel = self.list.selected().filter(|&i| i < self.stations.len());
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => return false,
-            KeyCode::Char('/') => self.open_form(FormKind::Search, Station::default()),
-            KeyCode::Down | KeyCode::Char('j') => self.list.select_next(),
-            KeyCode::Up | KeyCode::Char('k') => self.list.select_previous(),
-            KeyCode::Enter => {
-                if let Some(i) = sel {
-                    self.play(self.stations[i].clone());
-                }
-            }
+            KeyCode::Char('q') => return false,
+            KeyCode::Tab => self.switch_tab(),
+            KeyCode::Char('/') => self.side.typing = true,
             KeyCode::Char(' ') => self.mpv.cmd(json!(["cycle", "pause"])),
             KeyCode::Char('s') => {
                 self.stop_recording();
                 self.mpv.cmd(json!(["stop"]));
             }
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => self
-                .mpv
-                .set("volume", json!((self.volume + 5.0).min(100.0))),
-            KeyCode::Char('-') | KeyCode::Left => {
-                self.mpv.set("volume", json!((self.volume - 5.0).max(0.0)))
-            }
+            // relative, so fast key presses never use a stale volume
+            KeyCode::Char('+') | KeyCode::Char('=') => self.mpv.cmd(json!(["add", "volume", 5])),
+            KeyCode::Char('-') => self.mpv.cmd(json!(["add", "volume", -5])),
             KeyCode::Char('m') => self.mpv.cmd(json!(["cycle", "mute"])),
             KeyCode::Char('r') => self.toggle_recording(),
             KeyCode::Char('c') => self.settings_row = Some(0),
-            KeyCode::Char('o') => self.open_form(FormKind::Open, Station::default()),
-            KeyCode::Char('a') => {
-                // prefill with the current stream, so "o" then "a" saves it
-                let st = self
-                    .now
-                    .clone()
-                    .filter(|n| !self.stations.iter().any(|s| s.url == n.url))
-                    .unwrap_or_default();
-                self.open_form(FormKind::Add, st);
+            KeyCode::Char('o') => {
+                self.open_form(FormKind::Open, vec![("Stream URL", String::new())])
             }
-            KeyCode::Char('e') => {
-                if let Some(i) = sel {
-                    self.open_form(FormKind::Edit(i), self.stations[i].clone());
-                }
-            }
-            KeyCode::Char('D') => {
-                if let Some(i) = sel {
-                    let st = self.stations.remove(i);
-                    self.status = format!("deleted {}", st.name);
-                    self.save_stations();
-                }
-            }
-            _ => {}
+            _ => self.on_side_key(key),
         }
         true
     }
 
-    fn open_form(&mut self, kind: FormKind, st: Station) {
-        let fields = match kind {
-            FormKind::Open => vec![("Stream URL", st.url)],
-            FormKind::Search => vec![("Search radio-browser.info", String::new())],
-            _ => vec![
-                ("Stream URL", st.url),
-                ("Name", st.name),
-                ("Image URL or file (optional)", st.image),
-            ],
-        };
-        self.form = Some(Form {
-            kind,
-            fields,
-            idx: 0,
-        });
-    }
-
-    fn submit_form(&mut self) {
-        let Some(form) = self.form.take() else { return };
-        let mut v = form.fields.into_iter().map(|(_, s)| s.trim().to_string());
-        let url = v.next().unwrap_or_default();
-        if url.is_empty() {
-            return;
-        }
-        if let FormKind::Search = form.kind {
-            self.status = format!("searching \"{url}\"...");
-            return search_stations(url, self.tx.clone());
-        }
-        let name = v
-            .next()
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| url.clone());
-        let st = Station {
-            name,
-            url,
-            image: v.next().unwrap_or_default(),
-        };
-        match form.kind {
-            FormKind::Open => self.play(st),
-            FormKind::Add => {
-                self.stations.push(st);
-                self.list.select(Some(self.stations.len() - 1));
-                self.save_stations();
-            }
-            FormKind::Edit(i) => {
-                self.stations[i] = st;
-                self.save_stations();
-            }
-            FormKind::Search => {}
-        }
-    }
-
     fn draw(&mut self, f: &mut Frame) {
+        self.hits.clear();
         let [main, motd, status, help] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .areas(f.area());
         f.render_widget(Paragraph::new(self.motd_line(motd.width as usize)), motd);
         let [left, right] =
-            Layout::horizontal([Constraint::Percentage(30), Constraint::Fill(1)]).areas(main);
-        self.draw_stations(f, left);
+            Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]).areas(main);
+        self.draw_sidebar(f, left);
         self.draw_player(f, right);
 
         f.render_widget(Paragraph::new(format!(" {}", self.status)).fg(DIM), status);
-        let bottom = match &self.form {
+        match &self.form {
             Some(form) => {
                 let (label, value) = &form.fields[form.idx];
                 let cursor = if (self.tick / 5).is_multiple_of(2) {
@@ -964,50 +993,27 @@ impl App {
                 } else {
                     " "
                 };
-                let mut l = vec![
+                let first = vec![
                     Span::raw(format!(" {label} "))
                         .fg(Color::Black)
                         .bg(ACCENT)
                         .bold(),
                     Span::raw(format!(" {value}{cursor}   ")),
                 ];
-                l.extend(chips(&[("enter", "next / ok"), ("esc", "cancel")]).spans);
-                Line::from(l)
+                self.chip_bar(f, help, first, &[("enter", "next / ok"), ("esc", "cancel")]);
             }
-            None if self.results.is_some() => chips(&[
-                ("enter", "play"),
-                ("a", "save station"),
-                ("/", "new search"),
-                ("esc", "back to my stations"),
-                ("space", "pause"),
-                ("s", "stop"),
-                ("←→", "volume"),
-                ("r", "rec"),
-            ]),
-            None => chips(&[
-                ("enter", "play"),
-                ("space", "pause"),
-                ("s", "stop"),
-                ("←→", "vol"),
-                ("m", "mute"),
-                ("r", "rec"),
-                ("/", "search"),
-                ("o", "url"),
-                ("a", "add"),
-                ("e", "edit"),
-                ("D", "del"),
-                ("c", "settings"),
-                ("q", "quit"),
-            ]),
-        };
-        f.render_widget(Paragraph::new(bottom), help);
+            None => {
+                let keys = self.help_keys();
+                self.chip_bar(f, help, vec![], &keys);
+            }
+        }
 
         if let Some(row) = self.settings_row {
             self.draw_settings(f, row);
         }
     }
 
-    fn draw_settings(&self, f: &mut Frame, row: usize) {
+    fn draw_settings(&mut self, f: &mut Frame, row: usize) {
         let area = f
             .area()
             .centered(Constraint::Length(58), Constraint::Length(11));
@@ -1015,6 +1021,17 @@ impl App {
         let block = panel("settings");
         let inner = block.inner(area).inner(Margin::new(1, 1));
         f.render_widget(block, area);
+        self.hits.push((area, Hit::Popup));
+        for i in 0..5 {
+            self.hits.push((
+                Rect {
+                    y: inner.y + i as u16,
+                    height: 1,
+                    ..inner
+                },
+                Hit::Setting(i),
+            ));
+        }
         let toggle = |on: bool| {
             if on {
                 Span::raw("● on ").fg(Color::Green).bold()
@@ -1044,7 +1061,7 @@ impl App {
             ),
         ];
         let w = inner.width as usize;
-        let mut lines: Vec<Line> = items
+        let lines: Vec<Line> = items
             .into_iter()
             .enumerate()
             .map(|(i, (label, value))| {
@@ -1063,14 +1080,23 @@ impl App {
                 }
             })
             .collect();
-        lines.push(Line::raw(""));
-        lines.push(chips(&[
+        f.render_widget(Paragraph::new(lines), inner);
+        let keys = [
             ("↑↓", "select"),
             ("space", "toggle"),
             ("←→", "adjust"),
             ("esc", "close"),
-        ]));
-        f.render_widget(Paragraph::new(lines), inner);
+        ];
+        self.chip_bar(
+            f,
+            Rect {
+                y: inner.y + 6,
+                height: 1,
+                ..inner
+            },
+            vec![],
+            &keys,
+        );
     }
 
     fn station_line(&self, s: &Station, info: Option<&str>) -> Line<'static> {
@@ -1097,38 +1123,11 @@ impl App {
         Line::from(l)
     }
 
-    fn draw_stations(&mut self, f: &mut Frame, area: Rect) {
-        let (items, title): (Vec<Line>, String) = match &self.results {
-            Some(r) => (
-                r.items
-                    .iter()
-                    .map(|(s, info)| self.station_line(s, Some(info)))
-                    .collect(),
-                format!("search · {} · {}", r.query, r.items.len()),
-            ),
-            None => (
-                self.stations
-                    .iter()
-                    .map(|s| self.station_line(s, None))
-                    .collect(),
-                format!("stations · {}", self.stations.len()),
-            ),
-        };
-        let list = List::new(items)
-            .block(panel(&title))
-            .highlight_symbol(Span::raw(" ▸ ").fg(PINK))
-            .highlight_style(Style::new().bg(SEL_BG).bold());
-        let state = match &mut self.results {
-            Some(r) => &mut r.list,
-            None => &mut self.list,
-        };
-        f.render_stateful_widget(list, area, state);
-    }
-
     fn draw_player(&mut self, f: &mut Frame, area: Rect) {
         let block = panel("now playing");
         let inner = block.inner(area);
         f.render_widget(block, area);
+        self.hits.push((inner, Hit::Player));
         let vis = self.settings.spectrum || self.settings.level_meter;
         let rec_h = if self.recording.is_some() { 5 } else { 0 };
         let top_c = if vis {
@@ -1163,6 +1162,8 @@ impl App {
         };
         self.draw_art(f, art);
         self.draw_info(f, info);
+        self.hits.push((art, Hit::Key(KeyCode::Char(' '))));
+        self.hits.push((sign, Hit::Key(KeyCode::Char(' '))));
         let (style, border) = if self.playing() {
             (
                 Style::new().fg(Color::White).bg(Color::Red).bold(),
@@ -1214,6 +1215,7 @@ impl App {
                 ACCENT,
             )
         };
+        let label_w = label.chars().count() as u16;
         let gauge = LineGauge::default()
             .filled_symbol("━")
             .unfilled_symbol("─")
@@ -1224,7 +1226,18 @@ impl App {
                 Span::raw("vol ").fg(DIM),
                 Span::raw(label).fg(color).bold(),
             ]));
-        f.render_widget(gauge, vol.inner(Margin::new(1, 0)));
+        let vol = vol.inner(Margin::new(1, 0));
+        f.render_widget(gauge, vol);
+        // the line starts after "vol 50% "
+        let line_x = 4 + label_w + 1;
+        self.hits.push((
+            Rect {
+                x: vol.x + line_x,
+                width: vol.width.saturating_sub(line_x),
+                ..vol
+            },
+            Hit::Volume,
+        ));
 
         if let Some((path, started)) = &self.recording {
             let reel = ["◐", "◓", "◑", "◒"][self.tick % 4];
@@ -1339,7 +1352,6 @@ impl App {
 
     // bubbles rise and grow: . -> o -> O
     fn logo_lines(&self) -> Vec<Line<'static>> {
-        let hash = |k: usize| k.wrapping_mul(2654435761) >> 7;
         let step = self.tick / 4;
         let mut lines: Vec<Line> = LOGO
             .iter()
@@ -1350,7 +1362,7 @@ impl App {
                     let k = (step + row).wrapping_sub(2);
                     for col in [12 + hash(k) % 14, 12 + hash(k + 99) % 14]
                         .into_iter()
-                        .take(1 + (hash(k) % 3 == 0) as usize)
+                        .take(1 + hash(k).is_multiple_of(3) as usize)
                     {
                         if chars[col] == ' ' {
                             chars[col] = ['O', 'o', '.'][row];
@@ -1375,31 +1387,48 @@ impl App {
         lines
     }
 
-    // New phrase every 8 s, letters roll in like slot machine reels.
-    fn motd_line(&self, w: usize) -> Line<'static> {
-        let n = self.tick / 80 + self.motd_seed;
-        let text = MOTD[n % MOTD.len()];
-        let pad = w.saturating_sub(text.chars().count()) / 2;
-        let t = self.tick % 80;
-        let spans: Vec<Span> = text
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                let settle = 2 + i * 8 / text.len();
-                let shown = if t < settle && c != ' ' {
-                    (b'a' + ((i * 7 + self.tick * 13) % 26) as u8) as char
+    // Centered phrase. Letters pop in with a sparkle, little stars twinkle around, then it stays.
+    fn motd_line(&mut self, w: usize) -> Line<'static> {
+        let (idx, started) = self.motd;
+        if started.elapsed() >= MOTD_EVERY {
+            self.motd = (idx + 1, Instant::now());
+        }
+        let t = started.elapsed().as_millis() as usize;
+        let text: Vec<char> = MOTD[idx % MOTD.len()].chars().collect();
+        let pad = w.saturating_sub(text.len()) / 2;
+        let gold = Style::new().fg(Color::Rgb(255, 225, 140));
+        let mut cells = vec![Span::raw(" "); w];
+        for (i, &c) in text.iter().enumerate().take(w) {
+            // each letter has its own moment, with a sparkle just before it
+            let at = 100 + hash(i + idx * 31) % 1200;
+            cells[pad + i] = match t {
+                _ if c == ' ' || t >= at + 160 => Span::raw(c.to_string()).fg(PINK).italic(),
+                _ if t >= at => Span::styled(
+                    if (at / 10).is_multiple_of(2) {
+                        "✦"
+                    } else {
+                        "✧"
+                    },
+                    gold,
+                ),
+                _ => Span::raw(" "),
+            };
+        }
+        if t < SPARKLE_MS as usize {
+            for k in 0..8 {
+                let d = 2 + hash(k + idx * 7) % 9;
+                let col = if k % 2 == 0 {
+                    pad.checked_sub(d)
                 } else {
-                    c
+                    Some(pad + text.len() + d - 1)
                 };
-                let color = if t < settle {
-                    DIM
-                } else {
-                    lerp(ACCENT, PINK, i as f32 / text.len() as f32)
-                };
-                Span::raw(shown.to_string()).fg(color).italic()
-            })
-            .collect();
-        Line::from([vec![Span::raw(" ".repeat(pad))], spans].concat())
+                let twinkle = ["·", "✧", "✦", "⋆", " "][(t / 120 + k) % 5];
+                if let Some(col) = col.filter(|&c| c < w) {
+                    cells[col] = Span::styled(twinkle, gold);
+                }
+            }
+        }
+        Line::from(cells)
     }
 
     fn draw_info(&self, f: &mut Frame, area: Rect) {
@@ -1598,6 +1627,9 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
             }
             last = now;
         }
+        if app.side.search_due() {
+            app.side.reload(&app.tx);
+        }
         if std::mem::take(&mut app.clear_screen) {
             term.clear()?;
         }
@@ -1605,10 +1637,14 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
         // read all queued keys before the next draw
         let mut timeout = frame.saturating_sub(last.elapsed());
         while event::poll(timeout)? {
-            if let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-                && !app.on_key(k.code)
-            {
+            let go_on = match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    app.on_key_event(k.code, k.modifiers)
+                }
+                Event::Mouse(m) => app.on_mouse(m),
+                _ => true,
+            };
+            if !go_on {
                 return Ok(());
             }
             timeout = Duration::ZERO;
@@ -1655,16 +1691,24 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
-    let (tx, rx) = mpsc::channel();
-    let mpv = Mpv::start(tx.clone())?;
-    let mut term = ratatui::init();
-    let stations: Vec<Station> = load_json("stations.json").unwrap_or_else(default_stations);
     let settings: Settings = load_json("settings.json").unwrap_or_default();
+    let defaults = default_stations();
+    let mut stations: Vec<Station> = load_json("stations.json").unwrap_or_else(|| defaults.clone());
+    // stations saved before sections existed get the section of the same default station
+    for s in stations.iter_mut().filter(|s| s.section.is_empty()) {
+        if let Some(d) = defaults.iter().find(|d| d.url == s.url) {
+            s.section = d.section.clone();
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let mpv = Mpv::start(tx.clone(), settings.volume)?;
+    let mut term = ratatui::init();
+    let settings_volume = settings.volume;
     let mut app = App {
         mpv,
         tx,
-        list: ListState::default().with_selected((!stations.is_empty()).then_some(0)),
         stations,
+        side: Sidebar::new(),
         form: None,
         meters: Meters::new(settings.meter_delay_ms),
         settings,
@@ -1677,26 +1721,46 @@ fn main() -> io::Result<()> {
         art_cache: None,
         picker: None,
         clear_screen: false,
-        results: None,
         paused: false,
         idle: true,
         core_idle: true,
         muted: false,
-        volume: 50.0,
+        volume: settings_volume,
         codec: String::new(),
         recording: None,
         status: String::new(),
         tick: 0,
-        motd_seed: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as usize)
-            .unwrap_or(0),
+        hits: vec![],
+        last_click: None,
+        motd: (
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as usize)
+                .unwrap_or(0),
+            Instant::now(),
+        ),
     };
     app.apply_vis();
+    // select the last station, without playing it
+    let last = app
+        .stations
+        .iter()
+        .position(|s| s.url == app.settings.last_url);
+    app.select_station(last.unwrap_or(usize::MAX));
     // draw first, the probe can take 2 s
     term.draw(|f| app.draw(f))?;
     app.picker = probe_graphics();
+    // after the probe, mouse events would confuse it
+    execute!(io::stdout(), EnableMouseCapture)?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
+    // start the sparkles after the probe, it can block for 2 s
+    app.motd.1 = Instant::now();
     let res = run(&mut term, &mut app, &rx);
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }

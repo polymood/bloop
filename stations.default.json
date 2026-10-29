@@ -1,202 +1,242 @@
 [
   {
-    "name": "Third Rock Radio",
-    "url": "http://rfcm.streamguys1.com/thirdrock-icy",
-    "image": ""
-  },
-  {
     "name": "FIP",
     "url": "https://icecast.radiofrance.fr/fip-midfi.mp3",
-    "image": "https://www.radiofrance.fr/s3/cruiser-production/2023/03/3a1422a4-6f1f-4e17-874c-bad21e67f39b/300x300_sc_fip-avatar.jpg"
+    "image": "https://www.radiofrance.fr/s3/cruiser-production/2023/03/3a1422a4-6f1f-4e17-874c-bad21e67f39b/300x300_sc_fip-avatar.jpg",
+    "section": "Radio France"
   },
   {
     "name": "FIP Jazz",
     "url": "https://icecast.radiofrance.fr/fipjazz-midfi.mp3",
-    "image": "https://www.radiofrance.fr/s3/cruiser-production/2019/06/840a4431-0db0-4a94-aa28-53f8de011ab6/300x300_fip-jazz-01.jpg"
+    "image": "https://www.radiofrance.fr/s3/cruiser-production/2019/06/840a4431-0db0-4a94-aa28-53f8de011ab6/300x300_fip-jazz-01.jpg",
+    "section": "Radio France"
   },
   {
     "name": "FIP Rock",
     "url": "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
-    "image": "https://cdn.radiofrance.fr/s3/cruiser-production/2019/06/f5b944ca-9a21-4970-8eed-e711dac8ac15/200x200_fip-rock_ok.jpg"
+    "image": "https://cdn.radiofrance.fr/s3/cruiser-production/2019/06/f5b944ca-9a21-4970-8eed-e711dac8ac15/200x200_fip-rock_ok.jpg",
+    "section": "Radio France"
   },
   {
     "name": "FIP Groove",
     "url": "https://icecast.radiofrance.fr/fipgroove-midfi.mp3",
-    "image": "https://www.radiofrance.fr/pikapi/images/95cf76c3-26bc-404e-be1c-b81666188c3f/2048"
+    "image": "https://www.radiofrance.fr/pikapi/images/95cf76c3-26bc-404e-be1c-b81666188c3f/2048",
+    "section": "Radio France"
   },
   {
     "name": "FIP Electro",
     "url": "https://icecast.radiofrance.fr/fipelectro-midfi.mp3",
-    "image": "https://dbs.radioline.fr/pictures/radio_aceab763e567bd2f18c4ccf1c084298f/logo600.jpg"
+    "image": "https://dbs.radioline.fr/pictures/radio_aceab763e567bd2f18c4ccf1c084298f/logo600.jpg",
+    "section": "Radio France"
   },
   {
     "name": "FIP World",
     "url": "https://icecast.radiofrance.fr/fipworld-midfi.mp3",
-    "image": "https://www.radiofrance.fr/s3/cruiser-production/2023/03/3a1422a4-6f1f-4e17-874c-bad21e67f39b/300x300_sc_fip-avatar.jpg"
+    "image": "https://www.radiofrance.fr/s3/cruiser-production/2023/03/3a1422a4-6f1f-4e17-874c-bad21e67f39b/300x300_sc_fip-avatar.jpg",
+    "section": "Radio France"
   },
   {
     "name": "FIP Reggae",
     "url": "https://icecast.radiofrance.fr/fipreggae-midfi.mp3",
-    "image": "https://www.radiofrance.fr/pikapi/images/a242c7c5-bf1e-468b-9cb9-2154550f8be7/2048"
+    "image": "https://www.radiofrance.fr/pikapi/images/a242c7c5-bf1e-468b-9cb9-2154550f8be7/2048",
+    "section": "Radio France"
   },
   {
     "name": "FIP Nouveautes",
     "url": "https://icecast.radiofrance.fr/fipnouveautes-midfi.mp3",
-    "image": "https://www.radiofrance.fr/s3/cruiser-production/2023/03/3a1422a4-6f1f-4e17-874c-bad21e67f39b/300x300_sc_fip-avatar.jpg"
+    "image": "https://www.radiofrance.fr/s3/cruiser-production/2023/03/3a1422a4-6f1f-4e17-874c-bad21e67f39b/300x300_sc_fip-avatar.jpg",
+    "section": "Radio France"
   },
   {
     "name": "France Inter",
     "url": "https://icecast.radiofrance.fr/franceinter-midfi.mp3",
-    "image": "https://www.lesentreprisesdupaysage.fr/content/uploads/2022/03/france_inter_logo_2021-svg-1024x1024.png"
+    "image": "https://www.lesentreprisesdupaysage.fr/content/uploads/2022/03/france_inter_logo_2021-svg-1024x1024.png",
+    "section": "Radio France"
   },
   {
     "name": "franceinfo",
     "url": "https://icecast.radiofrance.fr/franceinfo-midfi.mp3",
-    "image": "https://www.radiofrance.fr/s3/cruiser-production/2022/06/52e277e9-95f8-44c4-8fda-6dfabc337b12/1200x680_franceinfo-logo-rs.jpg"
+    "image": "https://www.radiofrance.fr/s3/cruiser-production/2022/06/52e277e9-95f8-44c4-8fda-6dfabc337b12/1200x680_franceinfo-logo-rs.jpg",
+    "section": "Radio France"
   },
   {
     "name": "France Culture",
     "url": "https://icecast.radiofrance.fr/franceculture-midfi.mp3",
-    "image": "https://radioplayer.myradioendirect.fr/public/uploads/radio_img/france-culture/fb_cover.jpg"
+    "image": "https://radioplayer.myradioendirect.fr/public/uploads/radio_img/france-culture/fb_cover.jpg",
+    "section": "Radio France"
   },
   {
     "name": "France Musique",
     "url": "https://icecast.radiofrance.fr/francemusique-midfi.mp3",
-    "image": "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/02/b9f9389f-7d94-4791-a17b-a29f4d79ebe6/200x200_sc_fm_webradios_baroque_3000x3000.webp"
+    "image": "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/02/b9f9389f-7d94-4791-a17b-a29f4d79ebe6/200x200_sc_fm_webradios_baroque_3000x3000.webp",
+    "section": "Radio France"
   },
   {
     "name": "Mouv'",
     "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3",
-    "image": "https://charte.radiofrance.fr/images/mouv/mouv-avatar.png"
+    "image": "https://charte.radiofrance.fr/images/mouv/mouv-avatar.png",
+    "section": "Radio France"
   },
   {
     "name": "Radio Nova",
     "url": "https://novazz.ice.infomaniak.ch/novazz-128.mp3",
-    "image": "https://www.nova.fr/wp-content/uploads/sites/2/2021/02/cropped-favicon.png"
+    "image": "https://www.nova.fr/wp-content/uploads/sites/2/2021/02/cropped-favicon.png",
+    "section": "France"
   },
   {
     "name": "TSF Jazz",
     "url": "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3",
-    "image": ""
+    "image": "",
+    "section": "France"
   },
   {
     "name": "Radio Meuh",
     "url": "https://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3",
-    "image": "https://www.radiomeuh.com/android-icon-192x192.png"
+    "image": "https://www.radiomeuh.com/android-icon-192x192.png",
+    "section": "France"
   },
   {
     "name": "Jazz Radio",
     "url": "http://jazzradio.ice.infomaniak.ch/jazzradio-high.mp3",
-    "image": "http://www.jazzradio.fr/apple-touch-icon-120x120.png"
+    "image": "http://www.jazzradio.fr/apple-touch-icon-120x120.png",
+    "section": "France"
   },
   {
-    "name": "Radio Swiss Jazz",
-    "url": "http://stream.srg-ssr.ch/m/rsj/mp3_128",
-    "image": "https://www.radioswissjazz.ch/social-media/rsj-web.png"
-  },
-  {
-    "name": "Radio Swiss Classic",
-    "url": "http://stream.srg-ssr.ch/m/rsc_de/mp3_128",
-    "image": "https://www.radioswissclassic.ch/favicon.ico"
-  },
-  {
-    "name": "Radio Swiss Pop",
-    "url": "http://stream.srg-ssr.ch/m/rsp/mp3_128",
-    "image": "http://www.radioswisspop.ch/favicon.ico"
-  },
-  {
-    "name": "Radio Paradise",
-    "url": "http://stream.radioparadise.com/mp3-192",
-    "image": "https://radioparadise.com/apple-touch-icon.png"
-  },
-  {
-    "name": "Radio Paradise Mellow",
-    "url": "http://stream.radioparadise.com/mellow-192",
-    "image": "https://radioparadise.com/apple-touch-icon.png"
-  },
-  {
-    "name": "Radio Paradise Rock",
-    "url": "http://stream.radioparadise.com/rock-192",
-    "image": "https://radioparadise.com/apple-touch-icon.png"
+    "name": "Third Rock Radio",
+    "url": "http://rfcm.streamguys1.com/thirdrock-icy",
+    "image": "",
+    "section": "World"
   },
   {
     "name": "KEXP Seattle",
     "url": "https://kexp-mp3-128.streamguys1.com/kexp128.mp3",
-    "image": ""
+    "image": "",
+    "section": "World"
   },
   {
     "name": "WFMU",
     "url": "http://stream0.wfmu.org/freeform-128k",
-    "image": "https://wfmu.org/images/wfmu_logo_94.gif"
+    "image": "https://wfmu.org/images/wfmu_logo_94.gif",
+    "section": "World"
   },
   {
     "name": "NTS 1",
     "url": "https://stream-relay-geo.ntslive.net/stream",
-    "image": "https://www.nts.live/apple-touch-icon.png?v=47re43rrzb"
+    "image": "https://www.nts.live/apple-touch-icon.png?v=47re43rrzb",
+    "section": "World"
   },
   {
     "name": "NTS 2",
     "url": "https://stream-relay-geo.ntslive.net/stream2",
-    "image": "https://www.nts.live/apple-touch-icon.png?v=47re43rrzb"
+    "image": "https://www.nts.live/apple-touch-icon.png?v=47re43rrzb",
+    "section": "World"
   },
   {
     "name": "Nightride FM",
     "url": "https://stream.nightride.fm/nightride.mp3",
-    "image": "https://f4.bcbits.com/img/0021204033_20.jpg"
+    "image": "https://f4.bcbits.com/img/0021204033_20.jpg",
+    "section": "World"
   },
   {
     "name": "Nightwave Plaza",
     "url": "https://radio.plaza.one/mp3",
-    "image": "https://plaza.one/icons/apple-touch-icon.png?v=7knqx0ar5k"
+    "image": "https://plaza.one/icons/apple-touch-icon.png?v=7knqx0ar5k",
+    "section": "World"
   },
   {
     "name": "SomaFM Groove Salad",
     "url": "https://ice1.somafm.com/groovesalad-128-mp3",
-    "image": "https://somafm.com/img3/groovesalad-400.jpg"
+    "image": "https://somafm.com/img3/groovesalad-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Drone Zone",
     "url": "https://ice1.somafm.com/dronezone-128-mp3",
-    "image": "https://somafm.com/img3/dronezone-400.jpg"
+    "image": "https://somafm.com/img3/dronezone-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM DEF CON Radio",
     "url": "https://ice1.somafm.com/defcon-128-mp3",
-    "image": "https://somafm.com/img3/defcon-400.jpg"
+    "image": "https://somafm.com/img3/defcon-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Secret Agent",
     "url": "https://ice1.somafm.com/secretagent-128-mp3",
-    "image": "https://somafm.com/img3/secretagent-400.jpg"
+    "image": "https://somafm.com/img3/secretagent-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Lush",
     "url": "https://ice1.somafm.com/lush-128-mp3",
-    "image": "https://somafm.com/img3/lush-400.jpg"
+    "image": "https://somafm.com/img3/lush-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Indie Pop Rocks",
     "url": "https://ice1.somafm.com/indiepop-128-mp3",
-    "image": "https://somafm.com/img3/indiepop-400.jpg"
+    "image": "https://somafm.com/img3/indiepop-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Space Station",
     "url": "https://ice1.somafm.com/spacestation-128-mp3",
-    "image": "https://somafm.com/img3/spacestation-400.jpg"
+    "image": "https://somafm.com/img3/spacestation-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Deep Space One",
     "url": "https://ice1.somafm.com/deepspaceone-128-mp3",
-    "image": "https://somafm.com/img3/deepspaceone-400.jpg"
+    "image": "https://somafm.com/img3/deepspaceone-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Beat Blender",
     "url": "https://ice1.somafm.com/beatblender-128-mp3",
-    "image": "https://somafm.com/img3/beatblender-400.jpg"
+    "image": "https://somafm.com/img3/beatblender-400.jpg",
+    "section": "SomaFM"
   },
   {
     "name": "SomaFM Underground 80s",
     "url": "https://ice1.somafm.com/u80s-128-mp3",
-    "image": "https://somafm.com/img3/u80s-400.jpg"
+    "image": "https://somafm.com/img3/u80s-400.jpg",
+    "section": "SomaFM"
+  },
+  {
+    "name": "Radio Paradise",
+    "url": "http://stream.radioparadise.com/mp3-192",
+    "image": "https://radioparadise.com/apple-touch-icon.png",
+    "section": "Radio Paradise"
+  },
+  {
+    "name": "Radio Paradise Mellow",
+    "url": "http://stream.radioparadise.com/mellow-192",
+    "image": "https://radioparadise.com/apple-touch-icon.png",
+    "section": "Radio Paradise"
+  },
+  {
+    "name": "Radio Paradise Rock",
+    "url": "http://stream.radioparadise.com/rock-192",
+    "image": "https://radioparadise.com/apple-touch-icon.png",
+    "section": "Radio Paradise"
+  },
+  {
+    "name": "Radio Swiss Jazz",
+    "url": "http://stream.srg-ssr.ch/m/rsj/mp3_128",
+    "image": "https://www.radioswissjazz.ch/social-media/rsj-web.png",
+    "section": "Radio Swiss"
+  },
+  {
+    "name": "Radio Swiss Classic",
+    "url": "http://stream.srg-ssr.ch/m/rsc_de/mp3_128",
+    "image": "https://www.radioswissclassic.ch/favicon.ico",
+    "section": "Radio Swiss"
+  },
+  {
+    "name": "Radio Swiss Pop",
+    "url": "http://stream.srg-ssr.ch/m/rsp/mp3_128",
+    "image": "http://www.radioswisspop.ch/favicon.ico",
+    "section": "Radio Swiss"
   }
 ]
