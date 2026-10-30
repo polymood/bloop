@@ -1601,7 +1601,7 @@ fn freq_axis(w: usize) -> String {
     s.into_iter().collect()
 }
 
-// Sleeps until a key, a mouse click, an mpv message or the next animation frame.
+// Sleeps until a key, a mouse click, an audio event or the next animation frame.
 fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> io::Result<()> {
     let start = Instant::now();
     let mut last = start;

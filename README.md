@@ -11,13 +11,13 @@
                     |_|
 ```
 
-**bloop** is a tiny web radio player for the terminal. It uses Rust, [ratatui](https://ratatui.rs) and [mpv](https://mpv.io).
+**bloop** is a tiny web radio player for the terminal. It uses Rust and [ratatui](https://ratatui.rs). It has its own audio engine and does not need an external player.
 
 ![bloop plays SomaFM Groove Salad, with the spectrum analyzer, the level meter and a recording](assets/player.png)
 
 ## Features
 
-- Play internet radio streams (MP3, AAC, Ogg, HLS and more).
+- Play internet radio streams: MP3, AAC, HE-AAC, Ogg Vorbis and FLAC. bloop does not play HLS streams.
 - Save stations with a name and an image, and sort them in sections.
 - Browse and search more than 50 000 stations on [radio-browser.info](https://www.radio-browser.info): popular stations, top voted stations, genres and countries.
 - Show the song title and the stream metadata.
@@ -33,8 +33,7 @@
 ## Requirements
 
 - Linux or macOS. On Windows, use WSL2.
-- Rust 1.88 or later.
-- mpv. bloop starts mpv to play the audio.
+- On Linux, a PulseAudio or PipeWire sound server. WSLg and most desktops have one.
 
 bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
 
@@ -42,26 +41,19 @@ bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
 
 ### From a release
 
-1. Install mpv:
-
-   ```sh
-   sudo apt install mpv    # Debian, Ubuntu, WSL
-   brew install mpv        # macOS
-   ```
-
-2. Download the archive for your system from the [releases page](../../releases):
+1. Download the archive for your system from the [releases page](../../releases):
 
    - `x86_64-unknown-linux-musl`: Linux and WSL on x86_64.
    - `aarch64-apple-darwin`: macOS on Apple silicon.
 
-3. Extract the archive and put `bloop` in a directory of your `PATH`:
+2. Extract the archive and put `bloop` in a directory of your `PATH`:
 
    ```sh
-   tar xzf bloop-v0.1.0-x86_64-unknown-linux-musl.tar.gz
-   install bloop-v0.1.0-x86_64-unknown-linux-musl/bloop ~/.local/bin/
+   tar xzf bloop-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+   install bloop-v0.2.0-x86_64-unknown-linux-musl/bloop ~/.local/bin/
    ```
 
-4. Start bloop:
+3. Start bloop:
 
    ```sh
    bloop
@@ -69,7 +61,11 @@ bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
 
 ### From the source code
 
-1. Install mpv and Rust 1.88 or later.
+1. Install Rust 1.88 or later and a C compiler. On Linux, also install the ALSA development files:
+
+   ```sh
+   sudo apt install build-essential pkg-config libasound2-dev    # Debian, Ubuntu, WSL
+   ```
 
 2. Build and install bloop:
 
