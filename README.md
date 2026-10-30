@@ -32,8 +32,9 @@
 
 ## Requirements
 
-- Linux or macOS. On Windows, use WSL2.
+- Linux, macOS or Windows 10 and later.
 - On Linux, a PulseAudio or PipeWire sound server. WSLg and most desktops have one.
+- On Windows, use Windows Terminal. The old console does not show the images.
 
 bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
 
@@ -45,13 +46,16 @@ bloop is tested on Ubuntu 24.04 (WSL2) with Windows Terminal.
 
    - `x86_64-unknown-linux-musl`: Linux and WSL on x86_64.
    - `aarch64-apple-darwin`: macOS on Apple silicon.
+   - `x86_64-pc-windows-msvc`: Windows on x86_64.
 
-2. Extract the archive and put `bloop` in a directory of your `PATH`:
+2. On Linux and macOS, extract the archive and put `bloop` in a directory of your `PATH`:
 
    ```sh
-   tar xzf bloop-v0.2.0-x86_64-unknown-linux-musl.tar.gz
-   install bloop-v0.2.0-x86_64-unknown-linux-musl/bloop ~/.local/bin/
+   tar xzf bloop-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+   install bloop-v0.3.0-x86_64-unknown-linux-musl/bloop ~/.local/bin/
    ```
+
+   On Windows, extract the `.zip` file. You can put `bloop.exe` in a directory of your `PATH`.
 
 3. Start bloop:
 
@@ -178,6 +182,8 @@ The meters need CPU time. When both meters are off, bloop does not analyze the a
 | `~/.config/bloop/stations.json` | Your stations and their sections |
 | `~/.config/bloop/settings.json` | Your settings, the volume, the last station and the closed sections |
 | `~/Music/bloop/` | Your recordings |
+
+On macOS, the settings are in `~/Library/Application Support/bloop/`. On Windows, the settings are in `%APPDATA%\bloop\` and the recordings are in your `Music\bloop\` folder.
 
 ## Privacy
 

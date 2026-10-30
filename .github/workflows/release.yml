@@ -20,6 +20,9 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-apple-darwin
             os: macos-14
+          # MSVC: MinGW does not compile fdk-aac
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,15 +42,24 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
+        shell: bash
         run: |
           name="bloop-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/bloop" README.md LICENSE "$name/"
-          tar czf "$name.tar.gz" "$name"
+          cp README.md LICENSE "$name/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/bloop.exe" "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            cp "target/${{ matrix.target }}/release/bloop" "$name/"
+            tar czf "$name.tar.gz" "$name"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: "*.tar.gz"
+          path: |
+            *.tar.gz
+            *.zip
 
   release:
     needs: build
@@ -57,9 +69,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - run: sha256sum *.tar.gz > SHA256SUMS
+      - run: sha256sum *.tar.gz *.zip > SHA256SUMS
       - run: >
-          gh release create "$GITHUB_REF_NAME" *.tar.gz SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip SHA256SUMS
           --repo "$GITHUB_REPOSITORY" --title "bloop $GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

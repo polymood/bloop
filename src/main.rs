@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{self, Write},
+    io,
     path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc::{self, Sender},
@@ -1667,6 +1667,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
 // Clicks and the wheel only. EnableMouseCapture also reports every mouse move.
 #[cfg(unix)]
 fn mouse(on: bool) {
+    use std::io::Write;
     let mode = if on { "h" } else { "l" };
     let mut out = io::stdout();
     let _ = write!(out, "\x1b[?1000{mode}\x1b[?1006{mode}");
