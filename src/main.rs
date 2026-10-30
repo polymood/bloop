@@ -243,6 +243,8 @@ impl Mpv {
                 "--demuxer-max-bytes=1MiB",
                 // mpv applies song titles from packets it keeps here, 0 loses every title
                 "--demuxer-max-back-bytes=256KiB",
+                // a dead station fails after 10 s, not 60 s, and bloop reconnects
+                "--network-timeout=10",
                 "--msg-level=all=no",
                 "--input-ipc-client=fd://0",
             ])
