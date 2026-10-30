@@ -6,11 +6,11 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed},
         mpsc::Sender,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -29,11 +29,17 @@ use crate::{Msg, USER_AGENT};
 pub const SCOPE_FRAMES: usize = 4096;
 // decoded audio waiting for the sound card
 const QUEUE_SECONDS: usize = 2;
-// sound card starts once this much is buffered
-const PREBUFFER_SECONDS: f32 = 0.4;
-// sound card period. PulseAudio's default buffer is 2 s: it takes the whole prebuffer at
-// once (a gap after the first sound) and plays on for 2 s after a stop.
-const PERIOD_SECONDS: f32 = 0.05;
+// Sound card period, the sound server buffers two (250 ms, as mpv). PulseAudio's default
+// buffer is 2 s and plays on for 2 s after a stop.
+const PERIOD_SECONDS: f32 = 0.125;
+// the sound card opens once this much is queued, at least the full buffer of the sound
+// server: its first request takes it all
+const PREBUFFER_SECONDS: f32 = 1.0;
+// The sound server must take the audio in real time. If it falls this far behind the clock,
+// the stream is stuck: open it again. cpal's PulseAudio client does this on WSLg after a
+// few minutes, and the audio cuts in and out.
+// ponytail: clock drift of the sound card also adds up, 1 s every few hours at 100 ppm: one skip
+const STALL_SECONDS: f32 = 1.0;
 // no data for this long: the connection is dead
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -53,8 +59,12 @@ struct Shared {
     muted: AtomicBool,
     // f32 bits
     gain: AtomicU32,
-    // the sound card asked for samples and the queue was empty
+    // the queue ran empty: the sound card plays silence until enough audio is queued again
     starving: AtomicBool,
+    // sample rate of the sound card stream
+    rate: AtomicU32,
+    // samples the sound card asked for, played or not
+    pulled: AtomicUsize,
     queue: Mutex<VecDeque<f32>>,
     room: Condvar,
     // stereo frames, interleaved, before the volume
@@ -100,6 +110,8 @@ impl Engine {
             muted: AtomicBool::new(self.muted),
             gain: AtomicU32::new(self.gain.to_bits()),
             starving: AtomicBool::new(true),
+            rate: AtomicU32::new(0),
+            pulled: AtomicUsize::new(0),
             queue: Mutex::new(VecDeque::new()),
             room: Condvar::new(),
             scope: Mutex::new(VecDeque::new()),
@@ -202,7 +214,7 @@ fn run(url: &str, sh: &Arc<Shared>, tx: &Sender<Msg>, id: u64) -> Result<(), Str
         sh: sh.clone(),
         stream: None,
         rate: 0,
-        started: false,
+        check: None,
         tx: tx.clone(),
         id,
     };
@@ -524,7 +536,8 @@ struct Output {
     // not Send on every platform, so it lives in the stream thread
     stream: Option<cpal::Stream>,
     rate: u32,
-    started: bool,
+    // stall check, from the last time the sound server was on time: time and samples pulled
+    check: Option<(Instant, usize)>,
     tx: Sender<Msg>,
     id: u64,
 }
@@ -541,10 +554,10 @@ impl Output {
         if channels == 0 || rate == 0 {
             return Ok(());
         }
-        if self.stream.is_none() || rate != self.rate {
-            self.stream = Some(open_device(&self.sh, rate)?);
+        if rate != self.rate {
+            self.stream = None;
             self.rate = rate;
-            self.started = false;
+            self.sh.rate.store(rate, Relaxed);
         }
         let mut q = self.sh.queue.lock().unwrap();
         while q.len() > rate as usize * 2 * QUEUE_SECONDS {
@@ -564,13 +577,21 @@ impl Output {
         }
         let ready = q.len() as f32 >= rate as f32 * 2.0 * PREBUFFER_SECONDS;
         drop(q);
-        if !self.started && ready {
-            self.stream
-                .as_ref()
-                .unwrap()
-                .play()
-                .map_err(|e| format!("sound device: {e}"))?;
-            self.started = true;
+        let pulled = self.sh.pulled.load(Relaxed);
+        if let Some((t, p)) = self.check {
+            let lag = t.elapsed().as_secs_f32() - (pulled - p) as f32 / (rate as f32 * 2.0);
+            if lag > STALL_SECONDS {
+                self.stream = None;
+            } else if lag <= PERIOD_SECONDS {
+                self.check = Some((Instant::now(), pulled));
+            }
+        }
+        if self.stream.is_none() && ready {
+            let (stream, fixed) = open_device(&self.sh, rate)?;
+            stream.play().map_err(|e| format!("sound device: {e}"))?;
+            self.stream = Some(stream);
+            // the default buffer can ask for more than STALL_SECONDS at once
+            self.check = fixed.then(|| (Instant::now(), self.sh.pulled.load(Relaxed)));
             let _ = self
                 .tx
                 .send(Msg::Audio(self.id, AudioEvent::Started { codec, rate }));
@@ -580,7 +601,8 @@ impl Output {
 }
 
 // Stereo f32 output at the stream's own rate: PulseAudio, WASAPI and CoreAudio convert it.
-fn open_device(sh: &Arc<Shared>, rate: u32) -> Result<cpal::Stream, String> {
+// true: the device took PERIOD_SECONDS
+fn open_device(sh: &Arc<Shared>, rate: u32) -> Result<(cpal::Stream, bool), String> {
     #[cfg(target_os = "linux")]
     let host =
         cpal::host_from_id(cpal::HostId::PulseAudio).unwrap_or_else(|_| cpal::default_host());
@@ -605,15 +627,17 @@ fn open_device(sh: &Arc<Shared>, rate: u32) -> Result<cpal::Stream, String> {
     };
     // a device that refuses this period gets its own default
     build(cpal::BufferSize::Fixed((rate as f32 * PERIOD_SECONDS) as u32))
-        .or_else(|_| build(cpal::BufferSize::Default))
+        .map(|s| (s, true))
+        .or_else(|_| build(cpal::BufferSize::Default).map(|s| (s, false)))
         .map_err(|e| format!("sound device: {e}"))
 }
 
 // The sound card callback: queue -> volume -> speakers, and a copy for the meters.
 fn fill(sh: &Shared, data: &mut [f32]) {
+    data.fill(0.0);
+    sh.pulled.fetch_add(data.len(), Relaxed);
     // stopped: the queue of the old station must not play over the new one
     if sh.paused.load(Relaxed) || sh.stop.load(Relaxed) {
-        data.fill(0.0);
         return;
     }
     let gain = if sh.muted.load(Relaxed) {
@@ -622,16 +646,74 @@ fn fill(sh: &Shared, data: &mut [f32]) {
         f32::from_bits(sh.gain.load(Relaxed))
     };
     let mut q = sh.queue.lock().unwrap();
+    // At the start and after an underrun, wait until the queue fills this whole request:
+    // a bit of audio, then silence, then a bit of audio sounds chopped. The sound server
+    // can ask for 2 s at once, more than the prebuffer.
+    if sh.starving.load(Relaxed) {
+        let second = sh.rate.load(Relaxed) as usize * 2;
+        let need = data
+            .len()
+            .max((second as f32 * PREBUFFER_SECONDS) as usize)
+            .min(second * QUEUE_SECONDS);
+        if q.len() < need {
+            return;
+        }
+        sh.starving.store(false, Relaxed);
+    }
     let n = data.len().min(q.len());
     let mut scope = sh.scope.lock().unwrap();
     for (out, s) in data.iter_mut().zip(q.drain(..n)) {
         scope.push_back(s);
         *out = s * gain;
     }
-    data[n..].fill(0.0);
     let extra = scope.len().saturating_sub(SCOPE_FRAMES * 2);
     scope.drain(..extra);
-    sh.starving.store(n < data.len(), Relaxed);
+    if n < data.len() {
+        sh.starving.store(true, Relaxed);
+    }
     drop((q, scope));
     sh.room.notify_one();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_waits_for_a_full_request() {
+        let sh = Shared {
+            stop: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
+            gain: AtomicU32::new(1.0f32.to_bits()),
+            starving: AtomicBool::new(true),
+            // 1 s = 20 samples, prebuffer 1 s
+            rate: AtomicU32::new(10),
+            pulled: AtomicUsize::new(0),
+            queue: Mutex::new(VecDeque::new()),
+            room: Condvar::new(),
+            scope: Mutex::new(VecDeque::new()),
+            record: Mutex::new(None),
+        };
+        let mut out = [9.0; 30];
+        sh.queue.lock().unwrap().extend([0.5; 25]);
+        // starting: 25 samples do not fill a 30 sample request, keep them
+        fill(&sh, &mut out);
+        assert_eq!(out, [0.0; 30]);
+        assert_eq!(sh.queue.lock().unwrap().len(), 25);
+        // 40 samples: play 30
+        sh.queue.lock().unwrap().extend([0.5; 15]);
+        fill(&sh, &mut out);
+        assert_eq!(out, [0.5; 30]);
+        assert!(!sh.starving.load(Relaxed));
+        // playing: 10 samples, then silence, then wait again
+        fill(&sh, &mut out);
+        assert_eq!(out[..10], [0.5; 10]);
+        assert_eq!(out[10..], [0.0; 20]);
+        assert!(sh.starving.load(Relaxed));
+        // after an underrun: the prebuffer (20) is not enough for a request of 30
+        sh.queue.lock().unwrap().extend([0.5; 20]);
+        fill(&sh, &mut out);
+        assert_eq!(out, [0.0; 30]);
+    }
 }
