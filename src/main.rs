@@ -173,6 +173,8 @@ struct Settings {
     hires_images: bool,
     // mpv processes audio before the speakers play it
     meter_delay_ms: u64,
+    // mpv writes its messages to mpv.log, for bug reports
+    debug_log: bool,
     volume: f64,
     last_url: String,
     last_section: String,
@@ -187,6 +189,7 @@ impl Default for Settings {
             cover_art: true,
             hires_images: true,
             meter_delay_ms: 250,
+            debug_log: false,
             volume: 50.0,
             last_url: String::new(),
             last_section: String::new(),
@@ -224,7 +227,7 @@ impl Drop for Mpv {
 }
 
 impl Mpv {
-    fn start(tx: Sender<Msg>, volume: f64) -> io::Result<Self> {
+    fn start(tx: Sender<Msg>, volume: f64, log: bool) -> io::Result<Self> {
         // mpv quits when this socket closes, so it never outlives us.
         let (sock, theirs) = UnixStream::pair()?;
         let child = Command::new("mpv")
@@ -243,12 +246,15 @@ impl Mpv {
                 "--demuxer-max-bytes=1MiB",
                 // mpv applies song titles from packets it keeps here, 0 loses every title
                 "--demuxer-max-back-bytes=256KiB",
+                // a dropped connection reconnects inside mpv: the cache hides the gap
+                "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_at_eof=1,reconnect_delay_max=5",
                 // a dead station fails after 10 s, not 60 s, and bloop reconnects
                 "--network-timeout=10",
                 "--msg-level=all=no",
                 "--input-ipc-client=fd://0",
             ])
             .arg(format!("--volume={volume}"))
+            .arg(format!("--log-file={}", log_file(log)))
             .stdin(Stdio::from(OwnedFd::from(theirs)))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -475,6 +481,15 @@ fn tilde(p: &std::path::Path) -> String {
     match p.strip_prefix(home()) {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => p.display().to_string(),
+    }
+}
+
+// empty: no log
+fn log_file(on: bool) -> String {
+    if on {
+        config_file("mpv.log").to_string_lossy().into_owned()
+    } else {
+        String::new()
     }
 }
 
@@ -781,6 +796,7 @@ impl App {
         self.meters.delay = Duration::from_millis(self.settings.meter_delay_ms);
         self.art_cache = None;
         self.apply_vis();
+        self.mpv.set("log-file", json!(log_file(self.settings.debug_log)));
     }
 
     // The filter costs CPU, so it only runs while a meter is on.
@@ -824,7 +840,7 @@ impl App {
     // A new mpv, with the volume and meters of the old one. Then tune in again.
     fn restart_mpv(&mut self, why: &str) {
         self.recording = None;
-        match Mpv::start(self.tx.clone(), self.settings.volume) {
+        match Mpv::start(self.tx.clone(), self.settings.volume, self.settings.debug_log) {
             Ok(mpv) => self.mpv = mpv,
             Err(e) => {
                 self.status = format!("{why}, cannot restart it: {e}");
@@ -1094,11 +1110,12 @@ impl App {
             match key {
                 KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => self.settings_row = None,
                 KeyCode::Up | KeyCode::Char('k') => self.settings_row = Some(row.saturating_sub(1)),
-                KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(4)),
+                KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(5)),
                 KeyCode::Enter | KeyCode::Char(' ') if row == 0 => s.spectrum = !s.spectrum,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 1 => s.level_meter = !s.level_meter,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 2 => s.cover_art = !s.cover_art,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 3 => s.hires_images = !s.hires_images,
+                KeyCode::Enter | KeyCode::Char(' ') if row == 5 => s.debug_log = !s.debug_log,
                 KeyCode::Left | KeyCode::Char('-') if row == 4 => {
                     s.meter_delay_ms = s.meter_delay_ms.saturating_sub(25)
                 }
@@ -1186,13 +1203,13 @@ impl App {
     fn draw_settings(&mut self, f: &mut Frame, row: usize) {
         let area = f
             .area()
-            .centered(Constraint::Length(58), Constraint::Length(11));
+            .centered(Constraint::Length(60), Constraint::Length(12));
         f.render_widget(Clear, area);
         let block = panel("settings");
         let inner = block.inner(area).inner(Margin::new(1, 1));
         f.render_widget(block, area);
         self.hits.push((area, Hit::Popup));
-        for i in 0..5 {
+        for i in 0..6 {
             self.hits.push((
                 Rect {
                     y: inner.y + i as u16,
@@ -1229,6 +1246,7 @@ impl App {
                 "Meter delay",
                 Span::raw(format!("◂ {:>4} ms ▸", self.settings.meter_delay_ms)).fg(ACCENT),
             ),
+            ("Debug log (mpv.log)", toggle(self.settings.debug_log)),
         ];
         let w = inner.width as usize;
         let lines: Vec<Line> = items
@@ -1260,7 +1278,7 @@ impl App {
         self.chip_bar(
             f,
             Rect {
-                y: inner.y + 6,
+                y: inner.y + 7,
                 height: 1,
                 ..inner
             },
@@ -1899,7 +1917,7 @@ fn main() -> io::Result<()> {
         }
     }
     let (tx, rx) = mpsc::channel();
-    let mpv = Mpv::start(tx.clone(), settings.volume)?;
+    let mpv = Mpv::start(tx.clone(), settings.volume, settings.debug_log)?;
     let mut term = ratatui::init();
     let settings_volume = settings.volume;
     let mut app = App {

@@ -18,6 +18,7 @@
 ## Features
 
 - Play internet radio streams (MP3, AAC, Ogg, HLS and more).
+- Connect again automatically when the connection drops.
 - Save stations with a name and an image, and sort them in sections.
 - Browse and search more than 50 000 stations on [radio-browser.info](https://www.radio-browser.info): popular stations, top voted stations, genres and countries.
 - Show the song title and the stream metadata.
@@ -172,6 +173,7 @@ Push `c` to open the settings. bloop saves each change immediately.
 | Album covers | on | Finds the cover of the current song. |
 | High-res images | on | Uses sixel, kitty or iTerm2 graphics if the terminal supports them. |
 | Meter delay | 250 ms | Moves the meters in time with the speakers. |
+| Debug log | off | Writes the mpv messages to `mpv.log`. Attach this file to a bug report. |
 
 The meters need CPU time. When both meters are off, bloop does not analyze the audio.
 
@@ -181,6 +183,7 @@ The meters need CPU time. When both meters are off, bloop does not analyze the a
 | --- | --- |
 | `~/.config/bloop/stations.json` | Your stations and their sections |
 | `~/.config/bloop/settings.json` | Your settings, the volume, the last station and the closed sections |
+| `~/.config/bloop/mpv.log` | The mpv messages, when the debug log is on |
 | `~/Music/bloop/` | Your recordings |
 
 ## Privacy
