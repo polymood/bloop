@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeMap,
-    io::{self, Write},
+    collections::{BTreeMap, VecDeque},
+    io::{self, BufRead, BufReader, Write},
+    os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc::{self, Sender},
@@ -26,11 +27,9 @@ use ratatui_image::{
     protocol::Protocol,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-mod audio;
 mod sidebar;
-use audio::{AudioEvent, Engine, SCOPE_FRAMES};
 use sidebar::{BrowseData, Sidebar, Tab};
 
 const ACCENT: Color = Color::Rgb(0, 200, 255);
@@ -118,13 +117,40 @@ const WAVES: [&str; 4] = [
     "  ( ( ( ● ) ) )  ",
 ];
 
-// Spectrum: 24 bands, about a third of an octave each.
+// Spectrum: band-pass filters inside mpv, measured with astats.
+// 24 bands is about a third of an octave each. More bands cost CPU in astats.
 const BANDS: usize = 24;
 const F_LO: f32 = 40.0;
 const F_HI: f32 = 16000.0;
+const VIS_REQUEST: u64 = 1;
+const PING_REQUEST: u64 = 2;
+// no answer for this long: mpv hangs, start a new one
+const MPV_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn band_freq(i: usize) -> f32 {
     F_LO * (F_HI / F_LO).powf(i as f32 / (BANDS - 1) as f32)
+}
+
+// Audio passes through unchanged. A mono copy is split into bands, astats measures them, pan drops them again.
+fn vis_filter() -> String {
+    let w = (F_HI / F_LO).log2() / (BANDS - 1) as f32;
+    let ids = |p: &str| (0..BANDS).map(|i| format!("[{p}{i}]")).collect::<String>();
+    let mut g = format!(
+        "aformat=channel_layouts=stereo,asplit=2[a][b];[b]pan=mono|c0=0.5*c0+0.5*c1,asplit={BANDS}{};",
+        ids("b")
+    );
+    for i in 0..BANDS {
+        let f = band_freq(i);
+        g += &format!("[b{i}]bandpass=f={f:.0}:width_type=o:w={w:.3}[f{i}];");
+    }
+    g += &format!(
+        "[a]{}amerge=inputs={},astats=metadata=1:reset=1:measure_overall=none:measure_perchannel=RMS_level+Peak_level,pan=stereo|c0=c0|c1=c1",
+        ids("f"),
+        BANDS + 1
+    );
+    // %len% is mpv's escape for special characters
+    // one thread: 24 tiny filters do not need a thread pool
+    format!("@vis:lavfi=graph=%{}%{g}:o=[threads=1]", g.len())
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -145,6 +171,8 @@ struct Settings {
     // sends song titles to iTunes
     cover_art: bool,
     hires_images: bool,
+    // mpv processes audio before the speakers play it
+    meter_delay_ms: u64,
     volume: f64,
     last_url: String,
     last_section: String,
@@ -158,6 +186,7 @@ impl Default for Settings {
             level_meter: false,
             cover_art: true,
             hires_images: true,
+            meter_delay_ms: 250,
             volume: 50.0,
             last_url: String::new(),
             last_section: String::new(),
@@ -167,15 +196,110 @@ impl Default for Settings {
 }
 
 enum Msg {
-    // audio engine event of session n
-    Audio(u64, AudioEvent),
+    Mpv(Value),
     Image(String, Option<DynamicImage>),
     Cover(String, Option<DynamicImage>),
     Browse(u64, Result<BrowseData, String>),
     Term(Event),
+    // mpv number n closed the socket: it crashed or was killed
+    MpvGone(u64),
 }
 
 const USER_AGENT: &str = "bloop/0.1";
+
+// mpv does all the audio work. We talk to it over JSON IPC.
+struct Mpv {
+    sock: UnixStream,
+    // a hung mpv never notices that the socket closed, so we kill it ourselves
+    child: std::process::Child,
+    // tells a replaced mpv from the current one
+    id: u64,
+}
+
+impl Drop for Mpv {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Mpv {
+    fn start(tx: Sender<Msg>, volume: f64) -> io::Result<Self> {
+        // mpv quits when this socket closes, so it never outlives us.
+        let (sock, theirs) = UnixStream::pair()?;
+        let child = Command::new("mpv")
+            .args([
+                "--idle=yes",
+                "--no-video",
+                "--no-terminal",
+                "--volume-max=100",
+                // lean: no Lua scripts, no youtube-dl, no video
+                "--load-scripts=no",
+                "--ytdl=no",
+                "--osc=no",
+                "--vid=no",
+                "--audio-display=no",
+                // live radio never seeks back, a small read-ahead is enough
+                "--demuxer-max-bytes=1MiB",
+                // mpv applies song titles from packets it keeps here, 0 loses every title
+                "--demuxer-max-back-bytes=256KiB",
+                "--msg-level=all=no",
+                "--input-ipc-client=fd://0",
+            ])
+            .arg(format!("--volume={volume}"))
+            .stdin(Stdio::from(OwnedFd::from(theirs)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "cannot start mpv ({e}). Install it: sudo apt install mpv"
+                ))
+            })?;
+        static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reader = BufReader::new(sock.try_clone()?);
+        thread::spawn(move || {
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(v) = serde_json::from_str(&line)
+                    && tx.send(Msg::Mpv(v)).is_err()
+                {
+                    return;
+                }
+            }
+            let _ = tx.send(Msg::MpvGone(id));
+        });
+        let mut mpv = Mpv { sock, child, id };
+        for (i, p) in [
+            "metadata",
+            "pause",
+            "volume",
+            "idle-active",
+            "audio-codec-name",
+            "core-idle",
+            "mute",
+            "seekable",
+        ]
+        .iter()
+        .enumerate()
+        {
+            mpv.cmd(json!(["observe_property", i + 1, p]));
+        }
+        Ok(mpv)
+    }
+
+    fn cmd(&mut self, c: Value) {
+        let _ = writeln!(self.sock, "{}", json!({ "command": c }));
+    }
+
+    fn request(&mut self, id: u64, c: Value) {
+        let _ = writeln!(self.sock, "{}", json!({ "command": c, "request_id": id }));
+    }
+
+    fn set(&mut self, prop: &str, v: Value) {
+        self.cmd(json!(["set_property", prop, v]));
+    }
+}
 
 enum FormKind {
     Add,
@@ -215,13 +339,14 @@ struct Form {
 }
 
 struct App {
-    audio: Engine,
+    mpv: Mpv,
     tx: Sender<Msg>,
     stations: Vec<Station>,
     side: Sidebar,
     form: Option<Form>,
     settings: Settings,
     settings_row: Option<usize>,
+    vis_on: bool,
     now: Option<Station>,
     meta: BTreeMap<String, String>,
     logo: Option<DynamicImage>,
@@ -232,15 +357,15 @@ struct App {
     clear_screen: bool,
     paused: bool,
     paused_at: Option<Instant>,
-    // a stream from the network, not a file
+    // live streams are not seekable, files are
     live: bool,
     retries: u32,
     reconnect_at: Option<Instant>,
+    // watchdog: last ping sent, oldest ping without an answer
+    ping_at: Instant,
+    unanswered: Option<Instant>,
     idle: bool,
-    // playing, but the sound card gets no data yet
-    buffering: bool,
-    // sample rate of the stream, for the spectrum
-    rate: f32,
+    core_idle: bool,
     muted: bool,
     volume: f64,
     codec: String,
@@ -259,22 +384,22 @@ struct App {
 
 // Each vec holds [L, R, bands...], 0..1.
 struct Meters {
-    // [L rms, R rms, L peak, R peak, bands...] in dB, empty when silent
+    // dB values, delayed until the speakers play them
+    queue: VecDeque<(Instant, Vec<f32>)>,
+    delay: Duration,
     db: Vec<f32>,
     level: Vec<f32>,
     hold: Vec<f32>,
-    scope: Vec<f32>,
-    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
 }
 
 impl Meters {
-    fn new() -> Self {
+    fn new(delay_ms: u64) -> Self {
         Meters {
+            queue: VecDeque::new(),
+            delay: Duration::from_millis(delay_ms),
             db: vec![],
             level: vec![0.0; 2 + BANDS],
             hold: vec![0.0; 2 + BANDS],
-            scope: vec![],
-            fft: rustfft::FftPlanner::new().plan_fft_forward(SCOPE_FRAMES),
         }
     }
 
@@ -283,60 +408,35 @@ impl Meters {
         !self.db.is_empty() || self.level.iter().chain(&self.hold).any(|v| *v > 0.001)
     }
 
-    // Levels of the last played samples: RMS and peak of L and R, band RMS from an FFT.
-    fn analyze(&mut self, audio: &Engine, rate: f32) {
-        audio.scope(&mut self.scope);
-        self.db.clear();
-        if self.scope.len() < SCOPE_FRAMES * 2 || rate <= 0.0 {
-            return;
-        }
-        let db = |power: f32| 10.0 * power.max(1e-12).log10();
-        // RMS and peak over the last 1024 frames, about the time of one screen frame
-        let recent = &self.scope[self.scope.len() - 2048..];
-        for ch in 0..2 {
-            let it = recent.iter().skip(ch).step_by(2);
-            self.db
-                .push(db(it.clone().map(|s| s * s).sum::<f32>() / 1024.0));
-        }
-        for ch in 0..2 {
-            let peak = recent
-                .iter()
-                .skip(ch)
-                .step_by(2)
-                .fold(0f32, |m, s| m.max(s.abs()));
-            self.db.push(db(peak * peak));
-        }
-        // mono mix with a Hann window
-        let n = SCOPE_FRAMES;
-        let mut buf: Vec<rustfft::num_complex::Complex<f32>> = self
-            .scope
-            .chunks_exact(2)
-            .enumerate()
-            .map(|(i, f)| {
-                let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos();
-                rustfft::num_complex::Complex::new((f[0] + f[1]) * 0.5 * w, 0.0)
-            })
-            .collect();
-        self.fft.process(&mut buf);
-        // a bin's power as part of the signal power (Hann window: sum of w^2 = 3n/8)
-        let scale = 2.0 / (n as f32 * n as f32 * 3.0 / 8.0);
-        let hz = rate / n as f32;
-        let ratio = (F_HI / F_LO).powf(0.5 / (BANDS - 1) as f32);
-        for b in 0..BANDS {
-            let (lo, hi) = (band_freq(b) / ratio, band_freq(b) * ratio);
-            let (first, last) = (
-                (lo / hz).round() as usize,
-                ((hi / hz).round() as usize).min(n / 2),
-            );
-            let power: f32 = buf[first.min(last)..=last]
-                .iter()
-                .map(|c| c.norm_sqr())
-                .sum();
-            self.db.push(db(power * scale));
-        }
+    fn push(&mut self, data: &Value) {
+        let get = |ch: usize, k: &str| {
+            data[format!("lavfi.astats.{ch}.{k}")]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(f32::NEG_INFINITY)
+        };
+        let mut db = vec![
+            get(1, "RMS_level"),
+            get(2, "RMS_level"),
+            get(1, "Peak_level"),
+            get(2, "Peak_level"),
+        ];
+        db.extend((0..BANDS).map(|i| get(i + 3, "RMS_level")));
+        self.queue.push_back((Instant::now(), db));
     }
 
-    fn step(&mut self, dt: f32) {
+    fn step(&mut self, dt: f32, live: bool) {
+        while self
+            .queue
+            .front()
+            .is_some_and(|(t, _)| t.elapsed() >= self.delay)
+        {
+            self.db = self.queue.pop_front().unwrap().1;
+        }
+        if !live {
+            self.queue.clear();
+            self.db.clear();
+        }
         let norm = |db: f32, lo: f32, hi: f32| ((db - lo) / (hi - lo)).clamp(0.0, 1.0);
         for i in 0..2 + BANDS {
             let (target, peak) = match (self.db.is_empty(), i) {
@@ -362,18 +462,24 @@ impl Meters {
     }
 }
 
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
 // "/home/me/x" -> "~/x"
 fn tilde(p: &std::path::Path) -> String {
-    match dirs::home_dir().and_then(|h| p.strip_prefix(h).ok()) {
-        Some(rest) => format!("~/{}", rest.display()),
-        None => p.display().to_string(),
+    match p.strip_prefix(home()) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => p.display().to_string(),
     }
 }
 
-// ~/.config/bloop on Linux, %APPDATA%\bloop on Windows
 fn config_file(name: &str) -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_default()
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
         .join("bloop")
         .join(name)
 }
@@ -608,7 +714,8 @@ impl App {
                 self.side.typing = false;
                 self.on_side_key(if up { KeyCode::Up } else { KeyCode::Down });
             } else if on(Hit::Player) {
-                self.set_volume(self.volume + if up { 5.0 } else { -5.0 });
+                self.mpv
+                    .cmd(json!(["add", "volume", if up { 5 } else { -5 }]));
             }
             return true;
         }
@@ -643,7 +750,7 @@ impl App {
             }
             Hit::Volume => {
                 let v = (m.column - rect.x) as f64 / rect.width.saturating_sub(1).max(1) as f64;
-                self.set_volume(v * 100.0);
+                self.mpv.set("volume", json!((v * 100.0).round()));
             }
             Hit::Setting(i) => {
                 self.settings_row = Some(i);
@@ -669,22 +776,28 @@ impl App {
     // after a change in the settings page
     fn save_settings(&mut self) {
         self.persist_settings();
+        self.meters.delay = Duration::from_millis(self.settings.meter_delay_ms);
         self.art_cache = None;
+        self.apply_vis();
     }
 
-    fn set_volume(&mut self, volume: f64) {
-        self.volume = volume.clamp(0.0, 100.0).round();
-        self.audio.set_volume(self.volume);
-        if self.volume != self.settings.volume {
-            self.settings.volume = self.volume;
-            self.persist_settings();
+    // The filter costs CPU, so it only runs while a meter is on.
+    fn apply_vis(&mut self) {
+        let want = self.settings.spectrum || self.settings.level_meter;
+        if want != self.vis_on {
+            self.mpv.cmd(if want {
+                json!(["af", "add", vis_filter()])
+            } else {
+                json!(["af", "remove", "@vis"])
+            });
+            self.vis_on = want;
         }
     }
 
     // Redraw only as often as something on screen moves.
     fn frame_interval(&self) -> Duration {
         let sparkles = self.motd.1.elapsed().as_millis() < SPARKLE_MS;
-        let buffering = self.now.is_some() && self.buffering;
+        let buffering = self.now.is_some() && !self.idle && self.core_idle && !self.paused;
         let still = self.now.is_some() && self.idle && !self.side.typing && self.form.is_none();
         let ms = if sparkles || self.meters.moving() {
             33
@@ -703,13 +816,42 @@ impl App {
     }
 
     fn playing(&self) -> bool {
-        self.now.is_some() && !self.idle && !self.paused && !self.buffering
+        self.now.is_some() && !self.idle && !self.paused && !self.core_idle
     }
 
-    // Called every frame: buffering state, and release a long pause.
-    fn poll_audio(&mut self) {
-        self.buffering = !self.idle && !self.paused && self.audio.starving();
-        // a long pause keeps the sound device and the connection open for nothing
+    // A new mpv, with the volume and meters of the old one. Then tune in again.
+    fn restart_mpv(&mut self, why: &str) {
+        self.recording = None;
+        match Mpv::start(self.tx.clone(), self.settings.volume) {
+            Ok(mpv) => self.mpv = mpv,
+            Err(e) => {
+                self.status = format!("{why}, cannot restart it: {e}");
+                return;
+            }
+        }
+        (self.ping_at, self.unanswered) = (Instant::now(), None);
+        self.vis_on = false;
+        self.apply_vis();
+        let resume = !self.paused && !self.idle;
+        (self.paused, self.idle, self.core_idle) = (false, true, true);
+        if let (true, Some(st)) = (resume, self.now.clone()) {
+            self.play(st);
+        }
+        self.status = format!("{why}, restarted it");
+    }
+
+    // Called every frame: ping mpv, restart it when it hangs, release a long pause.
+    fn watchdog(&mut self) {
+        if self.ping_at.elapsed() > Duration::from_secs(2) {
+            self.mpv
+                .request(PING_REQUEST, json!(["get_property", "pid"]));
+            self.ping_at = Instant::now();
+            self.unanswered.get_or_insert(self.ping_at);
+        }
+        if self.unanswered.is_some_and(|t| t.elapsed() > MPV_TIMEOUT) {
+            return self.restart_mpv("audio engine did not answer");
+        }
+        // a long pause keeps the audio device and the connection open for nothing
         if self.paused
             && !self.idle
             && self
@@ -717,8 +859,7 @@ impl App {
                 .is_some_and(|t| t.elapsed() > RESUME_LIVE_AFTER)
         {
             self.stop_recording();
-            self.audio.stop();
-            self.idle = true;
+            self.mpv.cmd(json!(["stop"]));
         }
     }
 
@@ -731,18 +872,15 @@ impl App {
         if self.idle || stale {
             self.play(st);
         } else {
-            self.paused = !self.paused;
-            self.paused_at = self.paused.then(Instant::now);
-            self.audio.set_paused(self.paused);
+            self.mpv.cmd(json!(["cycle", "pause"]));
         }
     }
 
     fn play(&mut self, st: Station) {
         self.stop_recording();
-        (self.reconnect_at, self.retries) = (None, 0);
-        self.audio.play(&st.url);
-        (self.paused, self.paused_at, self.idle, self.buffering) = (false, None, false, true);
-        self.live = st.url.contains("://");
+        self.reconnect_at = None;
+        self.mpv.set("pause", json!(false));
+        self.mpv.cmd(json!(["loadfile", st.url]));
         self.meta.clear();
         self.codec.clear();
         self.logo = None;
@@ -761,7 +899,7 @@ impl App {
 
     fn stop_recording(&mut self) {
         if let Some((p, _)) = self.recording.take() {
-            self.audio.record(None);
+            self.mpv.set("stream-record", json!(""));
             self.status = format!("recording saved: {}", tilde(&p));
         }
     }
@@ -774,31 +912,31 @@ impl App {
             self.status = "nothing to record".into();
             return;
         };
-        // the stream bytes as they come: the file type is the stream's codec
+        // copy the stream as is, mpv picks the container from the extension
         let ext = match self.codec.as_str() {
-            "" => {
-                self.status = "nothing to record yet".into();
-                return;
-            }
-            "vorbis" => "ogg",
-            codec => codec,
+            "mp3" => "mp3",
+            "aac" => "aac",
+            "vorbis" | "opus" => "ogg",
+            "flac" => "flac",
+            _ => "mka",
         };
         let name: String = st
             .name
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
             .collect();
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let music = dirs::audio_dir().or_else(|| dirs::home_dir().map(|h| h.join("Music")));
-        let dir = music.unwrap_or_default().join("bloop");
+        let stamp = Command::new("date")
+            .arg("+%Y%m%d-%H%M%S")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let dir = home().join("Music/bloop");
         let path = dir.join(format!("{name}-{stamp}.{ext}"));
-        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::create(&path)) {
-            Ok(file) => self.audio.record(Some(file)),
-            Err(e) => {
-                self.status = format!("cannot record to {}: {e}", tilde(&path));
-                return;
-            }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("cannot create {}: {e}", tilde(&dir));
+            return;
         }
+        self.mpv.set("stream-record", json!(path));
         self.status = format!("recording to {}", tilde(&path));
         self.recording = Some((path, Instant::now()));
     }
@@ -823,63 +961,97 @@ impl App {
                 }
             }
             Msg::Browse(id, res) => self.on_browse_data(id, res),
-            // from a station we already left
-            Msg::Audio(id, _) if id != self.audio.session() => {}
-            Msg::Audio(_, AudioEvent::Started { codec, rate }) => {
-                (self.codec, self.rate, self.retries) = (codec.into(), rate as f32, 0);
-                if self.status.starts_with("tuning") {
-                    self.status.clear();
+            Msg::MpvGone(id) if id == self.mpv.id => self.restart_mpv("audio engine stopped"),
+            // an mpv we replaced ourselves
+            Msg::MpvGone(_) => {}
+            Msg::Mpv(v) if v["request_id"] == PING_REQUEST => self.unanswered = None,
+            Msg::Mpv(v) if v["request_id"] == VIS_REQUEST => {
+                if v["data"].is_object() {
+                    self.meters.push(&v["data"]);
                 }
             }
-            Msg::Audio(_, AudioEvent::Meta(m)) => {
-                let old = self.meta.get("icy-title").cloned();
-                self.meta
-                    .extend(m.into_iter().map(|(k, v)| (k, v.trim().to_string())));
-                self.meta.retain(|_, v| !v.is_empty());
-                let title = self.meta.get("icy-title");
-                if title != old.as_ref() {
-                    self.cover = None;
-                    self.art_cache = None;
-                    if let Some(t) = title.filter(|t| self.settings.cover_art && t.contains(" - "))
-                    {
-                        load_cover(t.clone(), self.tx.clone());
+            Msg::Mpv(v) => match (v["event"].as_str(), v["name"].as_str()) {
+                (Some("property-change"), Some(name)) => {
+                    let d = &v["data"];
+                    match name {
+                        "metadata" => {
+                            let old = self.meta.remove("icy-title");
+                            self.meta = d
+                                .as_object()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|(k, v)| {
+                                    Some((k.clone(), v.as_str()?.trim().to_string()))
+                                })
+                                .filter(|(_, v)| !v.is_empty())
+                                .collect();
+                            let title = self.meta.get("icy-title");
+                            if title != old.as_ref() {
+                                self.cover = None;
+                                self.art_cache = None;
+                                if let Some(t) =
+                                    title.filter(|t| self.settings.cover_art && t.contains(" - "))
+                                {
+                                    load_cover(t.clone(), self.tx.clone());
+                                }
+                            }
+                        }
+                        "pause" => {
+                            self.paused = d.as_bool().unwrap_or(false);
+                            self.paused_at = self.paused.then(Instant::now);
+                        }
+                        "seekable" => self.live = d.as_bool() == Some(false),
+                        "volume" => {
+                            self.volume = d.as_f64().unwrap_or(self.volume);
+                            if (self.volume - self.settings.volume).abs() > 0.1 {
+                                self.settings.volume = self.volume;
+                                self.persist_settings();
+                            }
+                        }
+                        "mute" => self.muted = d.as_bool().unwrap_or(false),
+                        "core-idle" => self.core_idle = d.as_bool().unwrap_or(true),
+                        "idle-active" => {
+                            self.idle = d.as_bool().unwrap_or(true);
+                            if !self.idle && self.status.starts_with("tuning") {
+                                self.status.clear();
+                            }
+                        }
+                        "audio-codec-name" => self.codec = d.as_str().unwrap_or("").to_string(),
+                        _ => {}
                     }
                 }
-            }
-            Msg::Audio(_, AudioEvent::Ended(res)) => {
-                (self.idle, self.buffering) = (true, false);
-                // a reconnect would overwrite the recording
-                self.stop_recording();
-                match res {
-                    // reconnecting to the station does not help
-                    Err(e) if e.starts_with("sound device") => {
-                        self.status = format!(
-                            "{e} (on WSL, `wsl --shutdown` in Windows restarts the sound server)"
-                        );
+                (Some("playback-restart"), _) => self.retries = 0,
+                (Some("end-file"), _) => {
+                    // "stop" is our own stop or a new station, "eof" on a file is its normal end
+                    let reason = v["reason"].as_str().unwrap_or("");
+                    let error = v["file_error"].as_str().unwrap_or("");
+                    // the sound server is down: reconnecting to the station does not help
+                    if error.contains("audio output") {
+                        self.stop_recording();
+                        self.status = "no sound device: the sound server does not answer \
+                            (on WSL, run `wsl --shutdown` in Windows)"
+                            .into();
+                        return;
                     }
-                    Err(e) if e.contains("unsupported codec") => {
-                        self.status =
-                            "this station's codec is not supported (bloop plays MP3, AAC, FLAC and Vorbis)".into();
+                    let dropped = reason == "error" || (reason == "eof" && self.live);
+                    if !dropped || self.now.is_none() {
+                        return;
                     }
-                    Err(e) if e.contains("not supported") || e.contains("unsupported") => {
-                        self.status = format!("playback error: {e}");
-                    }
-                    // the end of a file
-                    Ok(()) if !self.live => {}
-                    res if self.retries < MAX_RETRIES => {
+                    // a reconnect would overwrite the file
+                    self.stop_recording();
+                    if self.retries < MAX_RETRIES {
                         self.retries += 1;
                         self.reconnect_at =
                             Some(Instant::now() + Duration::from_secs(2 * self.retries as u64));
-                        let why = res.err().unwrap_or("stream ended".into());
                         self.status =
-                            format!("{why}, reconnecting ({}/{MAX_RETRIES})", self.retries);
-                    }
-                    res => {
-                        let why = res.err().unwrap_or("stream ended".into());
+                            format!("stream lost, reconnecting ({}/{MAX_RETRIES})", self.retries);
+                    } else {
+                        let why = v["file_error"].as_str().unwrap_or("stream ended");
                         self.status = format!("playback error: {why}");
                     }
                 }
-            }
+                _ => {}
+            },
         }
     }
 
@@ -920,11 +1092,17 @@ impl App {
             match key {
                 KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => self.settings_row = None,
                 KeyCode::Up | KeyCode::Char('k') => self.settings_row = Some(row.saturating_sub(1)),
-                KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(3)),
+                KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(4)),
                 KeyCode::Enter | KeyCode::Char(' ') if row == 0 => s.spectrum = !s.spectrum,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 1 => s.level_meter = !s.level_meter,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 2 => s.cover_art = !s.cover_art,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 3 => s.hires_images = !s.hires_images,
+                KeyCode::Left | KeyCode::Char('-') if row == 4 => {
+                    s.meter_delay_ms = s.meter_delay_ms.saturating_sub(25)
+                }
+                KeyCode::Right | KeyCode::Char('+') if row == 4 => {
+                    s.meter_delay_ms = (s.meter_delay_ms + 25).min(2000)
+                }
                 _ => return true,
             }
             self.save_settings();
@@ -942,15 +1120,13 @@ impl App {
             KeyCode::Char('s') => {
                 self.reconnect_at = None;
                 self.stop_recording();
-                self.audio.stop();
-                (self.idle, self.paused, self.buffering) = (true, false, false);
+                self.mpv.set("pause", json!(false));
+                self.mpv.cmd(json!(["stop"]));
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => self.set_volume(self.volume + 5.0),
-            KeyCode::Char('-') => self.set_volume(self.volume - 5.0),
-            KeyCode::Char('m') => {
-                self.muted = !self.muted;
-                self.audio.set_muted(self.muted);
-            }
+            // relative, so fast key presses never use a stale volume
+            KeyCode::Char('+') | KeyCode::Char('=') => self.mpv.cmd(json!(["add", "volume", 5])),
+            KeyCode::Char('-') => self.mpv.cmd(json!(["add", "volume", -5])),
+            KeyCode::Char('m') => self.mpv.cmd(json!(["cycle", "mute"])),
             KeyCode::Char('r') => self.toggle_recording(),
             KeyCode::Char('c') => self.settings_row = Some(0),
             KeyCode::Char('o') => {
@@ -1008,13 +1184,13 @@ impl App {
     fn draw_settings(&mut self, f: &mut Frame, row: usize) {
         let area = f
             .area()
-            .centered(Constraint::Length(58), Constraint::Length(10));
+            .centered(Constraint::Length(58), Constraint::Length(11));
         f.render_widget(Clear, area);
         let block = panel("settings");
         let inner = block.inner(area).inner(Margin::new(1, 1));
         f.render_widget(block, area);
         self.hits.push((area, Hit::Popup));
-        for i in 0..4 {
+        for i in 0..5 {
             self.hits.push((
                 Rect {
                     y: inner.y + i as u16,
@@ -1047,6 +1223,10 @@ impl App {
                 },
                 toggle(self.settings.hires_images),
             ),
+            (
+                "Meter delay",
+                Span::raw(format!("◂ {:>4} ms ▸", self.settings.meter_delay_ms)).fg(ACCENT),
+            ),
         ];
         let w = inner.width as usize;
         let lines: Vec<Line> = items
@@ -1078,7 +1258,7 @@ impl App {
         self.chip_bar(
             f,
             Rect {
-                y: inner.y + 5,
+                y: inner.y + 6,
                 height: 1,
                 ..inner
             },
@@ -1428,7 +1608,7 @@ impl App {
                 format!("{} RECONNECTING", SPINNER[self.tick % 10]),
                 Color::Yellow,
             ),
-            // a long pause stops the stream, it still is a pause for the user
+            // a long pause stops mpv, it still is a pause for the user
             _ if self.now.is_some() && self.paused => (
                 if (self.tick / 5).is_multiple_of(2) {
                     "▮▮ PAUSED"
@@ -1439,7 +1619,7 @@ impl App {
                 Color::Yellow,
             ),
             _ if self.now.is_none() || self.idle => ("■ STOPPED".to_string(), DIM),
-            _ if self.buffering => (
+            _ if self.core_idle => (
                 format!("{} BUFFERING", SPINNER[self.tick % 10]),
                 Color::Yellow,
             ),
@@ -1601,7 +1781,7 @@ fn freq_axis(w: usize) -> String {
     s.into_iter().collect()
 }
 
-// Sleeps until a key, a mouse click, an audio event or the next animation frame.
+// Sleeps until a key, a mouse click, an mpv message or the next animation frame.
 fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> io::Result<()> {
     let start = Instant::now();
     let mut last = start;
@@ -1610,23 +1790,20 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
         let now = Instant::now();
         if redraw || now - last >= app.frame_interval() {
             app.tick = (start.elapsed().as_millis() / 100) as usize;
-            app.poll_audio();
-            if app.playing() && (app.settings.spectrum || app.settings.level_meter) {
-                app.meters.analyze(&app.audio, app.rate);
-            } else {
-                app.meters.db.clear();
+            let live = app.playing() && app.vis_on;
+            app.meters.step((now - last).as_secs_f32().min(0.2), live);
+            if live {
+                app.mpv
+                    .request(VIS_REQUEST, json!(["get_property", "af-metadata/vis"]));
             }
-            app.meters.step((now - last).as_secs_f32().min(0.2));
             if app.side.search_due() {
                 app.side.reload(&app.tx);
             }
+            app.watchdog();
             if app.reconnect_at.is_some_and(|t| Instant::now() >= t)
                 && let Some(st) = app.now.clone()
             {
-                // play() starts a new count, a reconnect keeps it
-                let retries = app.retries;
                 app.play(st);
-                app.retries = retries;
             }
             if std::mem::take(&mut app.clear_screen) {
                 // not term.clear(): it asks the terminal for the cursor position,
@@ -1645,8 +1822,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
             continue;
         };
         // meter values are drawn with the next frame, not at once
-        // Windows reports every mouse move, nothing changes on screen for those
-        redraw = !matches!(&m, Msg::Term(Event::Mouse(e)) if e.kind == MouseEventKind::Moved);
+        redraw = !matches!(&m, Msg::Mpv(v) if v["request_id"] == VIS_REQUEST);
         let go_on = match m {
             Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
                 app.on_key_event(k.code, k.modifiers)
@@ -1665,26 +1841,11 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
 }
 
 // Clicks and the wheel only. EnableMouseCapture also reports every mouse move.
-#[cfg(unix)]
 fn mouse(on: bool) {
     let mode = if on { "h" } else { "l" };
     let mut out = io::stdout();
     let _ = write!(out, "\x1b[?1000{mode}\x1b[?1006{mode}");
     let _ = out.flush();
-}
-
-// Windows reads the console input API, not escape codes: moves come too, run() skips them.
-#[cfg(windows)]
-fn mouse(on: bool) {
-    use ratatui::crossterm::{
-        event::{DisableMouseCapture, EnableMouseCapture},
-        execute,
-    };
-    let _ = if on {
-        execute!(io::stdout(), EnableMouseCapture)
-    } else {
-        execute!(io::stdout(), DisableMouseCapture)
-    };
 }
 
 // Ask the terminal for its graphics protocol and cell size.
@@ -1736,18 +1897,19 @@ fn main() -> io::Result<()> {
         }
     }
     let (tx, rx) = mpsc::channel();
-    let audio = Engine::new(tx.clone(), settings.volume);
+    let mpv = Mpv::start(tx.clone(), settings.volume)?;
     let mut term = ratatui::init();
     let settings_volume = settings.volume;
     let mut app = App {
-        audio,
+        mpv,
         tx,
         stations,
         side: Sidebar::new(),
         form: None,
-        meters: Meters::new(),
+        meters: Meters::new(settings.meter_delay_ms),
         settings,
         settings_row: None,
+        vis_on: false,
         now: None,
         meta: BTreeMap::new(),
         logo: None,
@@ -1760,9 +1922,10 @@ fn main() -> io::Result<()> {
         live: false,
         retries: 0,
         reconnect_at: None,
+        ping_at: Instant::now(),
+        unanswered: None,
         idle: true,
-        buffering: false,
-        rate: 0.0,
+        core_idle: true,
         muted: false,
         volume: settings_volume,
         codec: String::new(),
@@ -1779,6 +1942,7 @@ fn main() -> io::Result<()> {
             Instant::now(),
         ),
     };
+    app.apply_vis();
     // select the last station, without playing it
     let last = app
         .stations
