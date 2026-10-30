@@ -133,7 +133,7 @@ const VIS_REQUEST: u64 = 1;
 const PING_REQUEST: u64 = 2;
 // no answer for this long: mpv hangs, start a new one
 const MPV_TIMEOUT: Duration = Duration::from_secs(8);
-const SETTINGS_ROWS: usize = 7;
+const SETTINGS_ROWS: usize = 8;
 
 fn band_freq(i: usize) -> f32 {
     F_LO * (F_HI / F_LO).powf(i as f32 / (BANDS - 1) as f32)
@@ -185,6 +185,8 @@ struct Settings {
     debug_log: bool,
     // empty: no scrobbling
     listenbrainz_token: String,
+    // no images, no animations, no meters, no phrases: text only
+    minimal: bool,
     volume: f64,
     last_url: String,
     last_section: String,
@@ -201,6 +203,7 @@ impl Default for Settings {
             meter_delay_ms: 250,
             debug_log: false,
             listenbrainz_token: String::new(),
+            minimal: false,
             volume: 50.0,
             last_url: String::new(),
             last_section: String::new(),
@@ -849,12 +852,13 @@ impl App {
         self.persist_settings();
         self.meters.delay = Duration::from_millis(self.settings.meter_delay_ms);
         self.apply_vis();
-        self.mpv.set("log-file", json!(log_file(self.settings.debug_log)));
+        self.mpv
+            .set("log-file", json!(log_file(self.settings.debug_log)));
     }
 
     // The filter costs CPU, so it only runs while a meter is on.
     fn apply_vis(&mut self) {
-        let want = self.settings.spectrum || self.settings.level_meter;
+        let want = (self.settings.spectrum || self.settings.level_meter) && !self.settings.minimal;
         if want != self.vis_on {
             self.mpv.cmd(if want {
                 json!(["af", "add", vis_filter()])
@@ -867,6 +871,10 @@ impl App {
 
     // Redraw only as often as something on screen moves.
     fn frame_interval(&self) -> Duration {
+        if self.settings.minimal {
+            // the clocks (sleep timer, recording) change once a second, keys redraw at once
+            return Duration::from_millis(if self.side.busy() { 200 } else { 1000 });
+        }
         let sparkles = self.motd.1.elapsed().as_millis() < SPARKLE_MS;
         let buffering = self.now.is_some() && !self.idle && self.core_idle && !self.paused;
         let still = self.now.is_some() && self.idle && !self.side.typing && self.form.is_none();
@@ -893,7 +901,11 @@ impl App {
     // A new mpv, with the volume and meters of the old one. Then tune in again.
     fn restart_mpv(&mut self, why: &str) {
         self.recording = None;
-        match Mpv::start(self.tx.clone(), self.settings.volume, self.settings.debug_log) {
+        match Mpv::start(
+            self.tx.clone(),
+            self.settings.volume,
+            self.settings.debug_log,
+        ) {
             Ok(mpv) => self.mpv = mpv,
             Err(e) => {
                 self.status = format!("{why}, cannot restart it: {e}");
@@ -1206,6 +1218,12 @@ impl App {
                     self.art_cache = None;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') if row == 5 => s.debug_log = !s.debug_log,
+                KeyCode::Enter | KeyCode::Char(' ') if row == 7 => {
+                    s.minimal = !s.minimal;
+                    // sixel and kitty images stay on screen until a clear
+                    self.art_cache = None;
+                    self.clear_screen = true;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') if row == 6 => {
                     let token = s.listenbrainz_token.clone();
                     self.open_form(
@@ -1263,12 +1281,14 @@ impl App {
         };
         let [main, motd, status, help] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(if self.settings.minimal { 0 } else { 1 }),
             Constraint::Length(1),
             Constraint::Length(help_h),
         ])
         .areas(f.area());
-        f.render_widget(Paragraph::new(self.motd_line(motd.width as usize)), motd);
+        if !self.settings.minimal {
+            f.render_widget(Paragraph::new(self.motd_line(motd.width as usize)), motd);
+        }
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]).areas(main);
         self.draw_sidebar(f, left);
@@ -1301,9 +1321,10 @@ impl App {
     }
 
     fn draw_settings(&mut self, f: &mut Frame, row: usize) {
-        let area = f
-            .area()
-            .centered(Constraint::Length(60), Constraint::Length(SETTINGS_ROWS as u16 + 6));
+        let area = f.area().centered(
+            Constraint::Length(60),
+            Constraint::Length(SETTINGS_ROWS as u16 + 6),
+        );
         f.render_widget(Clear, area);
         let block = panel("settings");
         let inner = block.inner(area).inner(Margin::new(1, 1));
@@ -1351,6 +1372,7 @@ impl App {
                 "ListenBrainz scrobbling",
                 toggle(!self.settings.listenbrainz_token.is_empty()),
             ),
+            ("Minimal mode (text only)", toggle(self.settings.minimal)),
         ];
         let w = inner.width as usize;
         let lines: Vec<Line> = items
@@ -1420,8 +1442,13 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
         self.hits.push((inner, Hit::Player));
-        let vis = self.settings.spectrum || self.settings.level_meter;
-        let rec_h = if self.recording.is_some() { 5 } else { 0 };
+        let minimal = self.settings.minimal;
+        let vis = (self.settings.spectrum || self.settings.level_meter) && !minimal;
+        let rec_h = match (&self.recording, minimal) {
+            (None, _) => 0,
+            (Some(_), true) => 1,
+            (Some(_), false) => 5,
+        };
         let top_c = if vis {
             Constraint::Length(14)
         } else {
@@ -1441,36 +1468,11 @@ impl App {
         .areas(inner);
 
         let top = top.inner(Margin::new(1, 1));
-        let [art, info, sign] = Layout::horizontal([
-            Constraint::Length(30),
-            Constraint::Fill(1),
-            Constraint::Length(10),
-        ])
-        .spacing(2)
-        .areas(top);
-        let art = Rect {
-            height: art.height.min(12),
-            ..art
-        };
-        self.draw_art(f, art);
-        self.draw_info(f, info);
-        self.hits.push((art, Hit::Key(KeyCode::Char(' '))));
-        self.hits.push((sign, Hit::Key(KeyCode::Char(' '))));
-        let (style, border) = if self.playing() {
-            (
-                Style::new().fg(Color::White).bg(Color::Red).bold(),
-                Color::Red,
-            )
+        if minimal {
+            self.draw_info(f, top);
         } else {
-            (Style::new().fg(DIM), BORDER)
-        };
-        let sign_block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(border));
-        f.render_widget(
-            Paragraph::new(Line::styled(" ON AIR ", style)).block(sign_block),
-            sign.intersection(Rect { height: 3, ..sign }),
-        );
+            self.draw_top(f, top);
+        }
 
         if vis {
             let block = Block::new()
@@ -1531,7 +1533,15 @@ impl App {
             Hit::Volume,
         ));
 
-        if let Some((path, started)) = &self.recording {
+        if let (Some((path, started)), true) = (&self.recording, minimal) {
+            let size = std::fs::metadata(path).map_or(0.0, |m| m.len() as f64 / 1e6);
+            let line = Line::from(vec![
+                Span::raw("● REC ").fg(Color::Red).bold(),
+                Span::raw(fmt_dur(started.elapsed())).bold(),
+                Span::raw(format!("  {size:.1} MB  {}", tilde(path))).fg(DIM),
+            ]);
+            f.render_widget(Paragraph::new(line), rec.inner(Margin::new(1, 0)));
+        } else if let Some((path, started)) = &self.recording {
             let reel = ["◐", "◓", "◑", "◒"][self.tick % 4];
             let tape: String = (0..8).map(|i| ["═", "─"][(i + self.tick) % 2]).collect();
             let cassette = [
@@ -1569,6 +1579,40 @@ impl App {
             ];
             f.render_widget(Paragraph::new(txt_lines), txt);
         }
+    }
+
+    // image, song and station, ON AIR sign
+    fn draw_top(&mut self, f: &mut Frame, top: Rect) {
+        let [art, info, sign] = Layout::horizontal([
+            Constraint::Length(30),
+            Constraint::Fill(1),
+            Constraint::Length(10),
+        ])
+        .spacing(2)
+        .areas(top);
+        let art = Rect {
+            height: art.height.min(12),
+            ..art
+        };
+        self.draw_art(f, art);
+        self.draw_info(f, info);
+        self.hits.push((art, Hit::Key(KeyCode::Char(' '))));
+        self.hits.push((sign, Hit::Key(KeyCode::Char(' '))));
+        let (style, border) = if self.playing() {
+            (
+                Style::new().fg(Color::White).bg(Color::Red).bold(),
+                Color::Red,
+            )
+        } else {
+            (Style::new().fg(DIM), BORDER)
+        };
+        let sign_block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(border));
+        f.render_widget(
+            Paragraph::new(Line::styled(" ON AIR ", style)).block(sign_block),
+            sign.intersection(Rect { height: 3, ..sign }),
+        );
     }
 
     fn draw_art(&mut self, f: &mut Frame, area: Rect) {
@@ -1725,7 +1769,15 @@ impl App {
 
     fn draw_info(&self, f: &mut Frame, area: Rect) {
         if self.now.is_none() {
-            return f.render_widget(Paragraph::new(self.logo_lines()), area);
+            let lines = if self.settings.minimal {
+                vec![
+                    Line::raw("bloop").bold(),
+                    Line::raw("push enter to play a station").fg(DIM),
+                ]
+            } else {
+                self.logo_lines()
+            };
+            return f.render_widget(Paragraph::new(lines), area);
         }
         let (label, color) = match () {
             _ if self.reconnect_at.is_some() => (
@@ -1925,7 +1977,12 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
     loop {
         let now = Instant::now();
         if redraw || now - last >= app.frame_interval() {
-            app.tick = (start.elapsed().as_millis() / 100) as usize;
+            // minimal mode: every animation stays on its first frame
+            app.tick = if app.settings.minimal {
+                0
+            } else {
+                (start.elapsed().as_millis() / 100) as usize
+            };
             let live = app.playing() && app.vis_on;
             app.meters.step((now - last).as_secs_f32().min(0.2), live);
             if live {

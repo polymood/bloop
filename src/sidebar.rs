@@ -481,7 +481,10 @@ impl App {
             ),
             KeyCode::Char('x') => self.open_form(
                 FormKind::Export,
-                vec![("Export stations to .m3u file", "~/bloop-stations.m3u".into())],
+                vec![(
+                    "Export stations to .m3u file",
+                    "~/bloop-stations.m3u".into(),
+                )],
             ),
             _ => {}
         }
@@ -504,7 +507,12 @@ impl App {
 
     fn on_songs_key(&mut self, key: KeyCode) {
         let rows = self.song_rows();
-        let song = self.side.songs.selected().and_then(|i| rows.get(i)).copied();
+        let song = self
+            .side
+            .songs
+            .selected()
+            .and_then(|i| rows.get(i))
+            .copied();
         match key {
             KeyCode::Down | KeyCode::Char('j') => self.side.songs.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.side.songs.select_previous(),
@@ -576,7 +584,11 @@ impl App {
     fn export_m3u(&mut self, path: &str) {
         let path = expand_tilde(path);
         self.status = match std::fs::write(&path, to_m3u(&self.stations)) {
-            Ok(()) => format!("exported {} stations to {}", self.stations.len(), tilde(&path)),
+            Ok(()) => format!(
+                "exported {} stations to {}",
+                self.stations.len(),
+                tilde(&path)
+            ),
             Err(e) => format!("cannot write {}: {e}", tilde(&path)),
         };
     }
@@ -884,7 +896,10 @@ impl App {
             let views = SONG_VIEWS.iter().enumerate().flat_map(|(i, v)| {
                 let s = Span::raw(format!("{} {v}", i + 1));
                 let on = (i == 1) == self.side.liked_only;
-                [if on { s.fg(PINK).bold() } else { s.fg(DIM) }, Span::raw("  ")]
+                [
+                    if on { s.fg(PINK).bold() } else { s.fg(DIM) },
+                    Span::raw("  "),
+                ]
             });
             f.render_widget(Paragraph::new(Line::from(views.collect::<Vec<_>>())), cats);
             let mut x = cats.x;
@@ -1087,10 +1102,14 @@ mod tests {
 
     #[test]
     fn m3u_reads_plain_lists() {
-        let list = "#EXTM3U\n#EXTINF:-1 group-title=\"Rock, Pop\",Radio X\nhttp://a/x\n\nhttp://b/y\n";
+        let list =
+            "#EXTM3U\n#EXTINF:-1 group-title=\"Rock, Pop\",Radio X\nhttp://a/x\n\nhttp://b/y\n";
         let st = from_m3u(list);
         assert_eq!(st.len(), 2);
-        assert_eq!((&st[0].name[..], &st[0].section[..]), ("Radio X", "Rock, Pop"));
+        assert_eq!(
+            (&st[0].name[..], &st[0].section[..]),
+            ("Radio X", "Rock, Pop")
+        );
         // no #EXTINF: the URL is the name
         assert_eq!((&st[1].name[..], &st[1].section[..]), ("http://b/y", ""));
     }

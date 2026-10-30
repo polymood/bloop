@@ -200,6 +200,7 @@ Push `c` to open the settings. bloop saves each change immediately.
 | Meter delay | 250 ms | Moves the meters in time with the speakers. |
 | Debug log | off | Writes the mpv messages to `mpv.log`. Attach this file to a bug report. |
 | ListenBrainz scrobbling | off | Push `enter` and type your user token from [listenbrainz.org/settings](https://listenbrainz.org/settings/). An empty token stops the scrobbling. |
+| Minimal mode | off | Shows text only: no images, no animations, no meters and no phrases. bloop then redraws the screen once a second, and uses less CPU. |
 
 When ListenBrainz scrobbling is on, bloop sends a song when it ends, if you listened to it for 30 seconds or more. bloop sends only the titles in the format "Artist - Title".
 
