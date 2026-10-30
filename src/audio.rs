@@ -31,6 +31,9 @@ pub const SCOPE_FRAMES: usize = 4096;
 const QUEUE_SECONDS: usize = 2;
 // sound card starts once this much is buffered
 const PREBUFFER_SECONDS: f32 = 0.4;
+// sound card period. PulseAudio's default buffer is 2 s: it takes the whole prebuffer at
+// once (a gap after the first sound) and plays on for 2 s after a stop.
+const PERIOD_SECONDS: f32 = 0.05;
 // no data for this long: the connection is dead
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -586,25 +589,30 @@ fn open_device(sh: &Arc<Shared>, rate: u32) -> Result<cpal::Stream, String> {
     let device = host
         .default_output_device()
         .ok_or("sound device: none found")?;
-    let config = cpal::StreamConfig {
-        channels: 2,
-        sample_rate: rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let sh = sh.clone();
-    device
-        .build_output_stream(
+    let build = |buffer_size| {
+        let config = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: rate,
+            buffer_size,
+        };
+        let sh = sh.clone();
+        device.build_output_stream(
             config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| fill(&sh, data),
             |_| {},
             None,
         )
+    };
+    // a device that refuses this period gets its own default
+    build(cpal::BufferSize::Fixed((rate as f32 * PERIOD_SECONDS) as u32))
+        .or_else(|_| build(cpal::BufferSize::Default))
         .map_err(|e| format!("sound device: {e}"))
 }
 
 // The sound card callback: queue -> volume -> speakers, and a copy for the meters.
 fn fill(sh: &Shared, data: &mut [f32]) {
-    if sh.paused.load(Relaxed) {
+    // stopped: the queue of the old station must not play over the new one
+    if sh.paused.load(Relaxed) || sh.stop.load(Relaxed) {
         data.fill(0.0);
         return;
     }
