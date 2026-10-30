@@ -13,8 +13,13 @@ use image::{DynamicImage, imageops::FilterType};
 use ratatui::{
     DefaultTerminal, Frame,
     backend::{Backend, ClearType},
-    crossterm::event::{
-        self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    crossterm::{
+        event::{
+            self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+            MouseEventKind,
+        },
+        execute,
+        terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
     },
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Style, Stylize},
@@ -744,13 +749,13 @@ impl App {
         });
         self.last_click = Some((Instant::now(), m.column, m.row));
         let Some((rect, hit)) = under.last().cloned() else {
-            self.settings_row = None;
+            self.close_settings();
             return true;
         };
         // a popup only reacts to its own areas and to the key chips
         if self.settings_row.is_some() && !matches!(hit, Hit::Popup | Hit::Setting(_) | Hit::Key(_))
         {
-            self.settings_row = None;
+            self.close_settings();
             return true;
         }
         if self.form.is_some() && !matches!(hit, Hit::Key(_)) {
@@ -790,11 +795,17 @@ impl App {
         }
     }
 
+    fn close_settings(&mut self) {
+        // the window can cover part of a sixel or kitty image: paint it all again
+        if self.settings_row.take().is_some() {
+            self.clear_screen = true;
+        }
+    }
+
     // after a change in the settings page
     fn save_settings(&mut self) {
         self.persist_settings();
         self.meters.delay = Duration::from_millis(self.settings.meter_delay_ms);
-        self.art_cache = None;
         self.apply_vis();
         self.mpv.set("log-file", json!(log_file(self.settings.debug_log)));
     }
@@ -1108,13 +1119,26 @@ impl App {
         if let Some(row) = self.settings_row {
             let s = &mut self.settings;
             match key {
-                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => self.settings_row = None,
-                KeyCode::Up | KeyCode::Char('k') => self.settings_row = Some(row.saturating_sub(1)),
-                KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(5)),
+                // moving saves nothing: a save redraws the image, and the screen blinks
+                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => {
+                    self.close_settings();
+                    return true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.settings_row = Some(row.saturating_sub(1));
+                    return true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.settings_row = Some((row + 1).min(5));
+                    return true;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') if row == 0 => s.spectrum = !s.spectrum,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 1 => s.level_meter = !s.level_meter,
                 KeyCode::Enter | KeyCode::Char(' ') if row == 2 => s.cover_art = !s.cover_art,
-                KeyCode::Enter | KeyCode::Char(' ') if row == 3 => s.hires_images = !s.hires_images,
+                KeyCode::Enter | KeyCode::Char(' ') if row == 3 => {
+                    s.hires_images = !s.hires_images;
+                    self.art_cache = None;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') if row == 5 => s.debug_log = !s.debug_log,
                 KeyCode::Left | KeyCode::Char('-') if row == 4 => {
                     s.meter_delay_ms = s.meter_delay_ms.saturating_sub(25)
@@ -1825,6 +1849,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
             {
                 app.play(st);
             }
+            // the terminal shows the finished frame only: no blink when the screen is cleared
+            execute!(io::stdout(), BeginSynchronizedUpdate)?;
             if std::mem::take(&mut app.clear_screen) {
                 // not term.clear(): it asks the terminal for the cursor position,
                 // and the input thread would swallow the answer
@@ -1834,6 +1860,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
                 term.swap_buffers();
             }
             term.draw(|f| app.draw(f))?;
+            execute!(io::stdout(), EndSynchronizedUpdate)?;
             last = now;
             redraw = false;
         }
