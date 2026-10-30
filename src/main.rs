@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 mod sidebar;
+mod songs;
 use sidebar::{BrowseData, Sidebar, Tab};
+use songs::Song;
 
 const ACCENT: Color = Color::Rgb(0, 200, 255);
 const PINK: Color = Color::Rgb(255, 80, 200);
@@ -131,6 +133,7 @@ const VIS_REQUEST: u64 = 1;
 const PING_REQUEST: u64 = 2;
 // no answer for this long: mpv hangs, start a new one
 const MPV_TIMEOUT: Duration = Duration::from_secs(8);
+const SETTINGS_ROWS: usize = 7;
 
 fn band_freq(i: usize) -> f32 {
     F_LO * (F_HI / F_LO).powf(i as f32 / (BANDS - 1) as f32)
@@ -180,6 +183,8 @@ struct Settings {
     meter_delay_ms: u64,
     // mpv writes its messages to mpv.log, for bug reports
     debug_log: bool,
+    // empty: no scrobbling
+    listenbrainz_token: String,
     volume: f64,
     last_url: String,
     last_section: String,
@@ -195,6 +200,7 @@ impl Default for Settings {
             hires_images: true,
             meter_delay_ms: 250,
             debug_log: false,
+            listenbrainz_token: String::new(),
             volume: 50.0,
             last_url: String::new(),
             last_section: String::new(),
@@ -211,6 +217,7 @@ enum Msg {
     Term(Event),
     // mpv number n closed the socket: it crashed or was killed
     MpvGone(u64),
+    Status(String),
 }
 
 const USER_AGENT: &str = "bloop/0.1";
@@ -321,6 +328,9 @@ enum FormKind {
     Move(usize),
     Rename(String),
     SaveTo(Station),
+    Import,
+    Export,
+    Token,
 }
 
 // What a mouse click on a screen area does.
@@ -393,6 +403,12 @@ struct App {
     hits: Vec<(Rect, Hit)>,
     // for double clicks
     last_click: Option<(Instant, u16, u16)>,
+    // newest last
+    songs: Vec<Song>,
+    // the song that plays now, for ListenBrainz: title, start in seconds since 1970, start
+    listening: Option<(String, u64, Instant)>,
+    // sleep timer: minutes, then stop
+    sleep: Option<(u64, Instant)>,
 }
 
 // Each vec holds [L, R, bands...], 0..1.
@@ -662,6 +678,15 @@ fn eighth(v: f32) -> &'static str {
     EIGHTHS[(v.clamp(0.0, 1.0) * 8.0).round() as usize]
 }
 
+// local time from date(1), "+%Y%m%d-%H%M%S" for example
+fn date(format: &str) -> String {
+    Command::new("date")
+        .arg(format)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -672,6 +697,23 @@ fn panel(title: &str) -> Block<'_> {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
         .title(Span::raw(format!(" {title} ")).fg(ACCENT).bold())
+}
+
+fn chip_width(k: &str, d: &str) -> u16 {
+    (Span::raw(format!(" {k} ")).width() + Span::raw(format!(" {d}  ")).width()) as u16
+}
+
+// lines of a chip bar that is `width` wide
+fn chip_lines(keys: &[(&str, &str)], width: u16) -> u16 {
+    let (mut lines, mut x) = (1, 0);
+    for (k, d) in keys {
+        let w = chip_width(k, d);
+        if x + w > width && x > 0 {
+            (lines, x) = (lines + 1, 0);
+        }
+        x += w;
+    }
+    lines
 }
 
 // "enter" -> Enter, "a" -> 'a'. Chips like "J K" have no single key.
@@ -703,7 +745,7 @@ impl App {
                 .bg(CHIP_BG)
                 .bold();
             let desc = Span::raw(format!(" {d}  ")).fg(DIM);
-            let w = (chip.width() + desc.width()) as u16;
+            let w = chip_width(k, d);
             if x + w > area.width && x > 0 {
                 lines.push(Line::default());
                 x = 0;
@@ -763,7 +805,7 @@ impl App {
         }
         match hit {
             Hit::Key(k) => return self.on_key(k),
-            Hit::Tab(t) if t != self.side.tab => self.switch_tab(),
+            Hit::Tab(t) => self.set_tab(t),
             Hit::Search => self.side.typing = true,
             Hit::List => self.click_row((m.row - rect.y) as usize, double),
             Hit::Category(i) => {
@@ -906,6 +948,7 @@ impl App {
     }
 
     fn play(&mut self, st: Station) {
+        self.end_listen();
         self.stop_recording();
         self.reconnect_at = None;
         self.mpv.set("pause", json!(false));
@@ -924,6 +967,30 @@ impl App {
             self.persist_settings();
         }
         self.now = Some(st);
+    }
+
+    fn stop(&mut self) {
+        self.end_listen();
+        self.reconnect_at = None;
+        self.stop_recording();
+        self.mpv.set("pause", json!(false));
+        self.mpv.cmd(json!(["stop"]));
+    }
+
+    // off, 15, 30, 60, 90 minutes, off
+    fn cycle_sleep(&mut self) {
+        let next = match self.sleep.map(|(m, _)| m) {
+            None => Some(15),
+            Some(15) => Some(30),
+            Some(30) => Some(60),
+            Some(60) => Some(90),
+            _ => None,
+        };
+        self.sleep = next.map(|m| (m, Instant::now() + Duration::from_secs(m * 60)));
+        self.status = match next {
+            Some(m) => format!("sleep timer: stop in {m} min"),
+            None => "sleep timer off".into(),
+        };
     }
 
     fn stop_recording(&mut self) {
@@ -954,11 +1021,7 @@ impl App {
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
             .collect();
-        let stamp = Command::new("date")
-            .arg("+%Y%m%d-%H%M%S")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        let stamp = date("+%Y%m%d-%H%M%S");
         let dir = home().join("Music/bloop");
         let path = dir.join(format!("{name}-{stamp}.{ext}"));
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -990,6 +1053,7 @@ impl App {
                 }
             }
             Msg::Browse(id, res) => self.on_browse_data(id, res),
+            Msg::Status(s) => self.status = s,
             Msg::MpvGone(id) if id == self.mpv.id => self.restart_mpv("audio engine stopped"),
             // an mpv we replaced ourselves
             Msg::MpvGone(_) => {}
@@ -1014,15 +1078,17 @@ impl App {
                                 })
                                 .filter(|(_, v)| !v.is_empty())
                                 .collect();
-                            let title = self.meta.get("icy-title");
-                            if title != old.as_ref() {
+                            let title = self.meta.get("icy-title").cloned();
+                            if title != old {
                                 self.cover = None;
                                 self.art_cache = None;
-                                if let Some(t) =
-                                    title.filter(|t| self.settings.cover_art && t.contains(" - "))
+                                if let Some(t) = title
+                                    .as_ref()
+                                    .filter(|t| self.settings.cover_art && t.contains(" - "))
                                 {
                                     load_cover(t.clone(), self.tx.clone());
                                 }
+                                self.on_title(title);
                             }
                         }
                         "pause" => {
@@ -1129,7 +1195,7 @@ impl App {
                     return true;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.settings_row = Some((row + 1).min(5));
+                    self.settings_row = Some((row + 1).min(SETTINGS_ROWS - 1));
                     return true;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') if row == 0 => s.spectrum = !s.spectrum,
@@ -1140,6 +1206,14 @@ impl App {
                     self.art_cache = None;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') if row == 5 => s.debug_log = !s.debug_log,
+                KeyCode::Enter | KeyCode::Char(' ') if row == 6 => {
+                    let token = s.listenbrainz_token.clone();
+                    self.open_form(
+                        FormKind::Token,
+                        vec![("ListenBrainz user token (empty: off)", token)],
+                    );
+                    return true;
+                }
                 KeyCode::Left | KeyCode::Char('-') if row == 4 => {
                     s.meter_delay_ms = s.meter_delay_ms.saturating_sub(25)
                 }
@@ -1160,12 +1234,11 @@ impl App {
             KeyCode::Tab => self.switch_tab(),
             KeyCode::Char('/') => self.side.typing = true,
             KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Char('s') => {
-                self.reconnect_at = None;
-                self.stop_recording();
-                self.mpv.set("pause", json!(false));
-                self.mpv.cmd(json!(["stop"]));
-            }
+            KeyCode::Char('s') => self.stop(),
+            KeyCode::Char('t') => self.cycle_sleep(),
+            // in the Songs tab, these act on the selected song
+            KeyCode::Char('l') if self.side.tab != Tab::Songs => self.toggle_like(None),
+            KeyCode::Char('y') if self.side.tab != Tab::Songs => self.copy_title(None),
             // relative, so fast key presses never use a stale volume
             KeyCode::Char('+') | KeyCode::Char('=') => self.mpv.cmd(json!(["add", "volume", 5])),
             KeyCode::Char('-') => self.mpv.cmd(json!(["add", "volume", -5])),
@@ -1182,11 +1255,17 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         self.hits.clear();
+        let keys = self.help_keys();
+        let help_h = if self.form.is_some() {
+            2
+        } else {
+            chip_lines(&keys, f.area().width).max(2)
+        };
         let [main, motd, status, help] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(2),
+            Constraint::Length(help_h),
         ])
         .areas(f.area());
         f.render_widget(Paragraph::new(self.motd_line(motd.width as usize)), motd);
@@ -1213,10 +1292,7 @@ impl App {
                 ];
                 self.chip_bar(f, help, first, &[("enter", "next / ok"), ("esc", "cancel")]);
             }
-            None => {
-                let keys = self.help_keys();
-                self.chip_bar(f, help, vec![], &keys);
-            }
+            None => self.chip_bar(f, help, vec![], &keys),
         }
 
         if let Some(row) = self.settings_row {
@@ -1227,13 +1303,13 @@ impl App {
     fn draw_settings(&mut self, f: &mut Frame, row: usize) {
         let area = f
             .area()
-            .centered(Constraint::Length(60), Constraint::Length(12));
+            .centered(Constraint::Length(60), Constraint::Length(SETTINGS_ROWS as u16 + 6));
         f.render_widget(Clear, area);
         let block = panel("settings");
         let inner = block.inner(area).inner(Margin::new(1, 1));
         f.render_widget(block, area);
         self.hits.push((area, Hit::Popup));
-        for i in 0..6 {
+        for i in 0..SETTINGS_ROWS {
             self.hits.push((
                 Rect {
                     y: inner.y + i as u16,
@@ -1271,6 +1347,10 @@ impl App {
                 Span::raw(format!("◂ {:>4} ms ▸", self.settings.meter_delay_ms)).fg(ACCENT),
             ),
             ("Debug log (mpv.log)", toggle(self.settings.debug_log)),
+            (
+                "ListenBrainz scrobbling",
+                toggle(!self.settings.listenbrainz_token.is_empty()),
+            ),
         ];
         let w = inner.width as usize;
         let lines: Vec<Line> = items
@@ -1302,7 +1382,7 @@ impl App {
         self.chip_bar(
             f,
             Rect {
-                y: inner.y + 7,
+                y: inner.y + SETTINGS_ROWS as u16 + 1,
                 height: 1,
                 ..inner
             },
@@ -1669,7 +1749,12 @@ impl App {
             ),
             _ => ("► PLAYING".to_string(), Color::Green),
         };
-        let mut lines = vec![Line::raw(label).fg(color).bold(), Line::raw("")];
+        let mut state = vec![Span::raw(label).fg(color).bold()];
+        if let Some((_, t)) = self.sleep {
+            let left = t.saturating_duration_since(Instant::now()).as_secs();
+            state.push(Span::raw(format!("   ☾ {}:{:02}", left / 60, left % 60)).fg(DIM));
+        }
+        let mut lines = vec![Line::from(state), Line::raw("")];
         let w = area.width as usize;
         if let Some(st) = &self.now {
             lines.push(
@@ -1678,7 +1763,14 @@ impl App {
                     .bold(),
             );
             if let Some(t) = self.meta.get("icy-title") {
-                lines.push(Line::raw(marquee(t, w, self.tick)).fg(ACCENT));
+                lines.push(if self.current_liked() {
+                    Line::from(vec![
+                        Span::raw("♥ ").fg(PINK),
+                        Span::raw(marquee(t, w.saturating_sub(2), self.tick)).fg(ACCENT),
+                    ])
+                } else {
+                    Line::raw(marquee(t, w, self.tick)).fg(ACCENT)
+                });
             }
             lines.push(Line::raw(""));
             let br = self
@@ -1844,6 +1936,11 @@ fn run(term: &mut DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<Msg>) -> i
                 app.side.reload(&app.tx);
             }
             app.watchdog();
+            if app.sleep.is_some_and(|(_, t)| Instant::now() >= t) {
+                app.sleep = None;
+                app.stop();
+                app.status = "sleep timer: stopped".into();
+            }
             if app.reconnect_at.is_some_and(|t| Instant::now() >= t)
                 && let Some(st) = app.now.clone()
             {
@@ -1981,6 +2078,9 @@ fn main() -> io::Result<()> {
         tick: 0,
         hits: vec![],
         last_click: None,
+        songs: load_json("history.json").unwrap_or_default(),
+        listening: None,
+        sleep: None,
         motd: (
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

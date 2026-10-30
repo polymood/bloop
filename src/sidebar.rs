@@ -1,13 +1,15 @@
-// Left sidebar: "My stations" (sections) and "Browse" (radio-browser.info).
+// Left sidebar: "My stations" (sections), "Browse" (radio-browser.info) and "Songs" (history).
 use super::*;
 
 const API: &str = "https://all.api.radio-browser.info/json/";
 const CATEGORIES: [&str; 4] = ["Popular", "Top voted", "Genres", "Countries"];
+const SONG_VIEWS: [&str; 2] = ["History", "Liked"];
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tab {
     Mine,
     Browse,
+    Songs,
 }
 
 pub enum Row {
@@ -45,6 +47,9 @@ pub struct Sidebar {
     filter: String,
     pub mine: ListState,
     pub browse: Browse,
+    songs: ListState,
+    liked_only: bool,
+    song_filter: String,
 }
 
 impl Sidebar {
@@ -65,6 +70,9 @@ impl Sidebar {
                 request_id: 0,
                 due: None,
             },
+            songs: ListState::default(),
+            liked_only: false,
+            song_filter: String::new(),
         }
     }
 
@@ -198,6 +206,56 @@ fn station_fields(st: &Station) -> Vec<(&'static str, String)> {
     ]
 }
 
+fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+// #EXTM3U playlist with the logo and the section of each station, as most players read it
+pub fn to_m3u(stations: &[Station]) -> String {
+    let mut out = String::from("#EXTM3U\n");
+    for st in stations {
+        out += &format!(
+            "#EXTINF:-1 tvg-logo=\"{}\" group-title=\"{}\",{}\n{}\n",
+            st.image, st.section, st.name, st.url
+        );
+    }
+    out
+}
+
+pub fn from_m3u(text: &str) -> Vec<Station> {
+    let mut out = vec![];
+    let mut info = "";
+    for line in text.lines().map(str::trim) {
+        if let Some(i) = line.strip_prefix("#EXTINF:") {
+            info = i;
+        } else if !line.is_empty() && !line.starts_with('#') {
+            // the name follows the first comma outside the quotes
+            let mut quoted = false;
+            let comma = info.char_indices().find(|&(_, c)| {
+                quoted ^= c == '"';
+                c == ',' && !quoted
+            });
+            let name = comma.map_or("", |(i, _)| info[i + 1..].trim());
+            let attr = |k: &str| {
+                let start = info.find(&format!("{k}=\""))? + k.len() + 2;
+                let len = info[start..].find('"')?;
+                Some(info[start..start + len].to_string())
+            };
+            out.push(Station {
+                name: if name.is_empty() { line } else { name }.to_string(),
+                url: line.to_string(),
+                image: attr("tvg-logo").unwrap_or_default(),
+                section: attr("group-title").unwrap_or_default(),
+            });
+            info = "";
+        }
+    }
+    out
+}
+
 impl App {
     // Sections in order of first appearance, stations in list order.
     pub fn mine_rows(&self) -> Vec<Row> {
@@ -238,12 +296,20 @@ impl App {
     }
 
     pub fn switch_tab(&mut self) {
-        self.side.tab = match self.side.tab {
+        self.set_tab(match self.side.tab {
             Tab::Mine => Tab::Browse,
-            Tab::Browse => Tab::Mine,
-        };
-        if self.side.tab == Tab::Browse && self.side.browse.request_id == 0 {
+            Tab::Browse => Tab::Songs,
+            Tab::Songs => Tab::Mine,
+        });
+    }
+
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.side.tab = tab;
+        if tab == Tab::Browse && self.side.browse.request_id == 0 {
             self.side.reload(&self.tx);
+        }
+        if tab == Tab::Songs {
+            self.side.songs.select(Some(0));
         }
     }
 
@@ -263,11 +329,11 @@ impl App {
 
     // Keys while the search bar has the keyboard.
     pub fn on_typing_key(&mut self, key: KeyCode) {
-        let browse = self.side.tab == Tab::Browse;
-        let text = if browse {
-            &mut self.side.browse.query
-        } else {
-            &mut self.side.filter
+        let tab = self.side.tab;
+        let text = match tab {
+            Tab::Mine => &mut self.side.filter,
+            Tab::Browse => &mut self.side.browse.query,
+            Tab::Songs => &mut self.side.song_filter,
         };
         match key {
             KeyCode::Char(c) => text.push(c),
@@ -279,12 +345,14 @@ impl App {
             KeyCode::Enter | KeyCode::Down | KeyCode::Tab => self.side.typing = false,
             _ => return,
         }
-        if browse {
-            // wait for a pause in typing, Enter searches at once
-            let wait = if self.side.typing { 400 } else { 0 };
-            self.side.browse.due = Some(Instant::now() + Duration::from_millis(wait));
-        } else {
-            self.side.mine.select(Some(0));
+        match tab {
+            Tab::Browse => {
+                // wait for a pause in typing, Enter searches at once
+                let wait = if self.side.typing { 400 } else { 0 };
+                self.side.browse.due = Some(Instant::now() + Duration::from_millis(wait));
+            }
+            Tab::Mine => self.side.mine.select(Some(0)),
+            Tab::Songs => self.side.songs.select(Some(0)),
         }
     }
 
@@ -295,6 +363,7 @@ impl App {
                 self.side.browse.query.clear();
                 self.side.browse.due = Some(Instant::now() + Duration::from_millis(400));
             }
+            Tab::Songs => self.side.song_filter.clear(),
         }
     }
 
@@ -302,6 +371,7 @@ impl App {
         match self.side.tab {
             Tab::Mine => self.on_mine_key(key),
             Tab::Browse => self.on_browse_key(key),
+            Tab::Songs => self.on_songs_key(key),
         }
     }
 
@@ -405,8 +475,110 @@ impl App {
                     self.save_stations();
                 }
             }
+            KeyCode::Char('i') => self.open_form(
+                FormKind::Import,
+                vec![("Import stations from .m3u file", "~/".into())],
+            ),
+            KeyCode::Char('x') => self.open_form(
+                FormKind::Export,
+                vec![("Export stations to .m3u file", "~/bloop-stations.m3u".into())],
+            ),
             _ => {}
         }
+    }
+
+    // Songs tab rows: indices in App::songs, newest first.
+    fn song_rows(&self) -> Vec<usize> {
+        let filter = self.side.song_filter.to_lowercase();
+        (0..self.songs.len())
+            .rev()
+            .filter(|&i| !self.side.liked_only || self.songs[i].liked)
+            .filter(|&i| {
+                let s = &self.songs[i];
+                filter.is_empty()
+                    || s.title.to_lowercase().contains(&filter)
+                    || s.station.to_lowercase().contains(&filter)
+            })
+            .collect()
+    }
+
+    fn on_songs_key(&mut self, key: KeyCode) {
+        let rows = self.song_rows();
+        let song = self.side.songs.selected().and_then(|i| rows.get(i)).copied();
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => self.side.songs.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.side.songs.select_previous(),
+            KeyCode::Char(c @ '1'..='2') => {
+                self.side.liked_only = c == '2';
+                self.side.songs.select(Some(0));
+            }
+            KeyCode::Left | KeyCode::Right => {
+                self.side.liked_only = !self.side.liked_only;
+                self.side.songs.select(Some(0));
+            }
+            KeyCode::Esc => self.side.song_filter.clear(),
+            KeyCode::Enter => {
+                if let Some(i) = song {
+                    let s = &self.songs[i];
+                    // a saved station keeps its name and logo
+                    let st = self
+                        .stations
+                        .iter()
+                        .find(|st| st.url == s.url)
+                        .cloned()
+                        .unwrap_or_else(|| Station {
+                            name: s.station.clone(),
+                            url: s.url.clone(),
+                            ..Default::default()
+                        });
+                    self.play(st);
+                }
+            }
+            KeyCode::Char('l') => self.toggle_like(song),
+            KeyCode::Char('y') => {
+                if let Some(i) = song {
+                    self.copy_title(Some(self.songs[i].title.clone()));
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some(i) = song {
+                    self.delete_song(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn import_m3u(&mut self, path: &str) {
+        let path = expand_tilde(path);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("cannot read {}: {e}", tilde(&path));
+                return;
+            }
+        };
+        let mut n = 0;
+        for mut st in from_m3u(&text) {
+            if self.stations.iter().any(|s| s.url == st.url) {
+                continue;
+            }
+            if st.section.is_empty() {
+                st.section = "Imported".into();
+            }
+            self.stations.push(st);
+            n += 1;
+        }
+        self.status = format!("imported {n} new stations from {}", tilde(&path));
+        self.save_stations();
+    }
+
+    fn export_m3u(&mut self, path: &str) {
+        let path = expand_tilde(path);
+        self.status = match std::fs::write(&path, to_m3u(&self.stations)) {
+            Ok(()) => format!("exported {} stations to {}", self.stations.len(), tilde(&path)),
+            Err(e) => format!("cannot write {}: {e}", tilde(&path)),
+        };
     }
 
     fn on_browse_key(&mut self, key: KeyCode) {
@@ -512,6 +684,18 @@ impl App {
                 self.save_stations();
                 self.persist_settings();
             }
+            FormKind::Import if !first.is_empty() => self.import_m3u(&first),
+            FormKind::Export if !first.is_empty() => self.export_m3u(&first),
+            FormKind::Token => {
+                self.settings.listenbrainz_token = first;
+                self.persist_settings();
+                if self.settings.listenbrainz_token.is_empty() {
+                    self.status = "ListenBrainz off".into();
+                } else {
+                    self.status = "ListenBrainz: checking the token…".into();
+                    self.check_token();
+                }
+            }
             FormKind::SaveTo(mut st) => {
                 st.section = first.clone();
                 self.status = format!("saved {} in {}", st.name, section_of(&st));
@@ -558,6 +742,15 @@ impl App {
                     }
                 }
             }
+            Tab::Songs => {
+                let i = self.side.songs.offset() + y;
+                if i < self.song_rows().len() {
+                    self.side.songs.select(Some(i));
+                    if double {
+                        self.on_songs_key(KeyCode::Enter);
+                    }
+                }
+            }
         }
     }
 
@@ -581,16 +774,27 @@ impl App {
                 ("g", "section"),
                 ("J K", "order"),
                 ("D", "delete"),
+                ("i", "import"),
+                ("x", "export"),
             ],
             Tab::Browse => vec![
-                ("tab", "my stations"),
+                ("tab", "songs"),
                 ("↑↓", "move"),
                 ("←→", "category"),
                 ("a", "save"),
                 ("esc", "back"),
             ],
+            Tab::Songs => vec![
+                ("tab", "my stations"),
+                ("↑↓", "move"),
+                ("←→", "liked"),
+                ("D", "delete"),
+            ],
         });
         keys.extend([
+            ("l", "like"),
+            ("y", "copy"),
+            ("t", "sleep"),
             ("s", "stop"),
             ("m", "mute"),
             ("r", "rec"),
@@ -608,10 +812,11 @@ impl App {
         let inner = block.inner(area).inner(Margin::new(1, 0));
         f.render_widget(block, area);
         let browse = self.side.tab == Tab::Browse;
+        let songs = self.side.tab == Tab::Songs;
         let [tabs, search, cats, list_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Length(if browse { 2 } else { 1 }),
+            Constraint::Length(if browse || songs { 2 } else { 1 }),
             Constraint::Fill(1),
         ])
         .areas(inner);
@@ -625,9 +830,11 @@ impl App {
             }
         };
         let mut tab_line = vec![
-            tab("My stations", !browse),
+            tab("My stations", self.side.tab == Tab::Mine),
             Span::raw(" "),
             tab("Browse", browse),
+            Span::raw(" "),
+            tab("Songs", songs),
         ];
         if browse && self.side.browse.loading {
             tab_line.push(Span::raw(format!("  {}", SPINNER[self.tick % 10])).fg(ACCENT));
@@ -643,16 +850,19 @@ impl App {
             },
             Hit::Tab(Tab::Browse),
         ));
+        self.hits.push((
+            Rect {
+                x: tabs.x + 23,
+                width: 7,
+                ..tabs
+            },
+            Hit::Tab(Tab::Songs),
+        ));
 
-        let text = if browse {
-            &self.side.browse.query
-        } else {
-            &self.side.filter
-        };
-        let hint = if browse {
-            "search all stations"
-        } else {
-            "filter my stations"
+        let (text, hint) = match self.side.tab {
+            Tab::Mine => (&self.side.filter, "filter my stations"),
+            Tab::Browse => (&self.side.browse.query, "search all stations"),
+            Tab::Songs => (&self.side.song_filter, "filter songs"),
         };
         let mut line = vec![Span::raw("/ ").fg(PINK)];
         if text.is_empty() && !self.side.typing {
@@ -670,6 +880,26 @@ impl App {
         f.render_widget(Paragraph::new(Line::from(line)).block(search_box), search);
         self.hits.push((search, Hit::Search));
 
+        if songs {
+            let views = SONG_VIEWS.iter().enumerate().flat_map(|(i, v)| {
+                let s = Span::raw(format!("{} {v}", i + 1));
+                let on = (i == 1) == self.side.liked_only;
+                [if on { s.fg(PINK).bold() } else { s.fg(DIM) }, Span::raw("  ")]
+            });
+            f.render_widget(Paragraph::new(Line::from(views.collect::<Vec<_>>())), cats);
+            let mut x = cats.x;
+            for (i, v) in SONG_VIEWS.iter().enumerate() {
+                let w = v.len() as u16 + 2;
+                let r = Rect {
+                    x,
+                    width: w,
+                    height: 1,
+                    ..cats
+                };
+                self.hits.push((r, Hit::Category(i)));
+                x += w + 2;
+            }
+        }
         if browse {
             let b = &self.side.browse;
             let line = match (&b.pick, b.query.trim().is_empty()) {
@@ -763,6 +993,24 @@ impl App {
                     ])
                 })
                 .collect(),
+            Tab::Songs => self
+                .song_rows()
+                .into_iter()
+                .map(|i| {
+                    let s = &self.songs[i];
+                    // "MM-DD HH:MM" of "YYYY-MM-DD HH:MM"
+                    let when = s.time.get(5..).unwrap_or(&s.time);
+                    let info = format!("{} · {when}", fit(&s.station, 14));
+                    let title = fit(&s.title, w.saturating_sub(info.chars().count() + 4));
+                    let pad = w.saturating_sub(title.chars().count() + info.chars().count() + 2);
+                    Line::from(vec![
+                        Span::raw(if s.liked { "♥ " } else { "  " }).fg(PINK),
+                        Span::raw(title),
+                        Span::raw(" ".repeat(pad)),
+                        Span::raw(info).fg(DIM),
+                    ])
+                })
+                .collect(),
             Tab::Browse => self
                 .side
                 .browse
@@ -791,6 +1039,9 @@ impl App {
                 Tab::Mine if !self.side.filter.is_empty() => "no station matches",
                 Tab::Mine => "no stations yet, push a to add one",
                 Tab::Browse => "no stations found",
+                Tab::Songs if !self.side.song_filter.is_empty() => "no song matches",
+                Tab::Songs if self.side.liked_only => "no liked songs yet, push l to like a song",
+                Tab::Songs => "no songs yet, the song titles show here as they play",
             };
             f.render_widget(Paragraph::new(msg).fg(DIM), list_area);
             return;
@@ -801,8 +1052,46 @@ impl App {
         let state = match self.side.tab {
             Tab::Mine => &mut self.side.mine,
             Tab::Browse => &mut self.side.browse.list,
+            Tab::Songs => &mut self.side.songs,
         };
         f.render_stateful_widget(list, list_area, state);
         self.hits.push((list_area, Hit::List));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m3u_keeps_name_logo_and_section() {
+        let st = vec![Station {
+            name: "FIP, Jazz".into(),
+            url: "https://example.com/fip.mp3".into(),
+            image: "https://example.com/fip.png".into(),
+            section: "Radio France".into(),
+        }];
+        let back = from_m3u(&to_m3u(&st));
+        assert_eq!(back.len(), 1);
+        let b = &back[0];
+        assert_eq!(
+            (&b.name[..], &b.url[..], &b.image[..], &b.section[..]),
+            (
+                "FIP, Jazz",
+                "https://example.com/fip.mp3",
+                "https://example.com/fip.png",
+                "Radio France"
+            )
+        );
+    }
+
+    #[test]
+    fn m3u_reads_plain_lists() {
+        let list = "#EXTM3U\n#EXTINF:-1 group-title=\"Rock, Pop\",Radio X\nhttp://a/x\n\nhttp://b/y\n";
+        let st = from_m3u(list);
+        assert_eq!(st.len(), 2);
+        assert_eq!((&st[0].name[..], &st[0].section[..]), ("Radio X", "Rock, Pop"));
+        // no #EXTINF: the URL is the name
+        assert_eq!((&st[1].name[..], &st[1].section[..]), ("http://b/y", ""));
     }
 }

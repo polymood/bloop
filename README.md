@@ -24,6 +24,10 @@
 - Show the song title and the stream metadata.
 - Show the album cover of the current song.
 - Record the stream to a file. bloop does not re-encode the audio.
+- Keep a history of the songs that played. Like a song to find it again, and copy its title.
+- Stop the radio after 15, 30, 60 or 90 minutes with the sleep timer.
+- Import and export your stations as an `.m3u` playlist.
+- Optional: send the songs that you listen to, to your [ListenBrainz](https://listenbrainz.org) account.
 - Show a spectrum analyzer and a stereo level meter. The meters use the real audio levels.
 - Show high-resolution images in terminals with sixel, kitty or iTerm2 graphics. Other terminals show half-block images.
 
@@ -93,16 +97,17 @@ GitHub Actions builds the archives and publishes the release.
 
 ## Keys
 
-The sidebar has two tabs. Push `tab` to go from one tab to the other.
+The sidebar has three tabs. Push `tab` to go to the next tab.
 
 - **My stations** shows your stations in sections.
 - **Browse** shows stations from radio-browser.info.
+- **Songs** shows the songs that played, newest first.
 
 ### All views
 
 | Key | Action |
 | --- | --- |
-| `tab` | Go to the other tab |
+| `tab` | Go to the next tab |
 | `↑` `↓` | Select the previous or next row |
 | `/` | Type in the search bar |
 | `space` | Pause or resume |
@@ -110,6 +115,9 @@ The sidebar has two tabs. Push `tab` to go from one tab to the other.
 | `-` `+` | Decrease or increase the volume (`=` also increases it) |
 | `m` | Mute |
 | `r` | Start or stop the recording |
+| `l` | Like the current song, or remove the like |
+| `y` | Copy the title of the current song |
+| `t` | Set the sleep timer: 15, 30, 60 or 90 minutes, or off |
 | `o` | Play a stream URL |
 | `c` | Open the settings |
 | `q` or `ctrl+c` | Quit |
@@ -125,6 +133,10 @@ The sidebar has two tabs. Push `tab` to go from one tab to the other.
 | `g` | Move the station to a different section |
 | `J` `K` | Move the station down or up in its section |
 | `D` | Delete the station |
+| `i` | Import stations from an `.m3u` file |
+| `x` | Export all stations to an `.m3u` file |
+
+The import adds only the stations that are not in your list. It keeps the name, the logo (`tvg-logo`) and the section (`group-title`) of each station. A station without a section goes to the "Imported" section.
 
 ### Browse
 
@@ -136,6 +148,19 @@ The sidebar has two tabs. Push `tab` to go from one tab to the other.
 | `a` | Save the station in a section |
 | `esc` or `←` | Go back to the list of genres or countries |
 
+### Songs
+
+| Key | Action |
+| --- | --- |
+| `1` `2` | Show all songs, or the liked songs only |
+| `←` `→` | Show the other list |
+| `enter` | Play the station of the song |
+| `l` | Like the song, or remove the like |
+| `y` | Copy the title of the song |
+| `D` | Delete the song from the history |
+
+The history keeps the last 1000 songs. It always keeps the liked songs. Copy uses the OSC 52 escape code: Windows Terminal, kitty, iTerm2 and most other terminals support it.
+
 ### Search bar
 
 | Key | Action |
@@ -144,7 +169,7 @@ The sidebar has two tabs. Push `tab` to go from one tab to the other.
 | `esc` | Clear the text and stop typing |
 | `ctrl+u` | Clear the text |
 
-In **My stations**, the search bar filters your stations. In **Browse**, it searches all stations while you type.
+In **My stations**, the search bar filters your stations. In **Browse**, it searches all stations while you type. In **Songs**, it filters the song titles and the station names.
 
 ### Mouse
 
@@ -174,6 +199,9 @@ Push `c` to open the settings. bloop saves each change immediately.
 | High-res images | on | Uses sixel, kitty or iTerm2 graphics if the terminal supports them. |
 | Meter delay | 250 ms | Moves the meters in time with the speakers. |
 | Debug log | off | Writes the mpv messages to `mpv.log`. Attach this file to a bug report. |
+| ListenBrainz scrobbling | off | Push `enter` and type your user token from [listenbrainz.org/settings](https://listenbrainz.org/settings/). An empty token stops the scrobbling. |
+
+When ListenBrainz scrobbling is on, bloop sends a song when it ends, if you listened to it for 30 seconds or more. bloop sends only the titles in the format "Artist - Title".
 
 The meters need CPU time. When both meters are off, bloop does not analyze the audio.
 
@@ -182,7 +210,8 @@ The meters need CPU time. When both meters are off, bloop does not analyze the a
 | File | Content |
 | --- | --- |
 | `~/.config/bloop/stations.json` | Your stations and their sections |
-| `~/.config/bloop/settings.json` | Your settings, the volume, the last station and the closed sections |
+| `~/.config/bloop/settings.json` | Your settings, the volume, the last station, the closed sections and your ListenBrainz token |
+| `~/.config/bloop/history.json` | The song history and the liked songs |
 | `~/.config/bloop/mpv.log` | The mpv messages, when the debug log is on |
 | `~/Music/bloop/` | Your recordings |
 
@@ -193,3 +222,4 @@ bloop sends data to these services:
 - **iTunes Search API**: the title of the current song, when the "Album covers" setting is on.
 - **radio-browser.info**: the text of your station search, and the genre or country that you open.
 - **Station logo servers**: a request for the logo of the station that you play.
+- **ListenBrainz**: the artist and the title of each song that you listen to, when you set a token.
